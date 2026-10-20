@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  initialize, setPolicy, reserve, getSpending, getPolicy, dayAt, accountId,
+  initialize, setPolicy, activatePolicy, getPendingPolicy, disablePolicy, cancelPolicy, POLICY_DELAY_NS, reserve, getSpending, getPolicy, dayAt, accountId,
   DAY_NS, U128_MAX, MIN_PAY_GAS, MAX_PAY_GAS, type Host, type Payment,
 } from "../contract/policy.ts";
 
 function fixture() {
   let caller = "owner.test.near";
-  let now = 20000n * DAY_NS;
+  let now = 19999n * DAY_NS;
   let deposit = 0n;
   let gas = MIN_PAY_GAS;
   let storage = new Map<string, string>();
@@ -22,6 +22,8 @@ function fixture() {
     recipients: ["alice.test.near"],
   };
   setPolicy(host, config, policy);
+  now += POLICY_DELAY_NS;
+  activatePolicy(host, getPendingPolicy(host)!.proposal_id);
   caller = config.agent_id;
   const payment = { token_id: policy.token_id, recipient_id: policy.recipients[0], amount: "40000000" };
   let sequence = 0;
@@ -96,6 +98,8 @@ test("strict integer u128 amounts and per-payment overflow", () => {
 test("integer arithmetic remains exact beyond JavaScript safe integers and at u128 maximum", () => {
   const f = fixture(); f.caller(f.config.owner_id);
   setPolicy(f.host, f.config, { ...f.policy, max_per_payment: U128_MAX.toString(), daily_limit: U128_MAX.toString() });
+  f.time(20001n * DAY_NS);
+  activatePolicy(f.host, getPendingPolicy(f.host)!.proposal_id);
   f.caller(f.config.agent_id);
   const big = 9007199254740993n;
   f.tx({ ...f.payment, amount: big.toString() });
@@ -106,9 +110,13 @@ test("integer arithmetic remains exact beyond JavaScript safe integers and at u1
 
 test("UTC midnight creates new bucket; historical days and tokens remain isolated", () => {
   const f = fixture();
-  f.time(20001n * DAY_NS - 1n); f.tx();
   f.caller(f.config.owner_id);
+  f.time(19999n * DAY_NS);
   setPolicy(f.host, f.config, { ...f.policy, token_id: "other.test.near" });
+  f.time(20000n * DAY_NS);
+  activatePolicy(f.host, getPendingPolicy(f.host)!.proposal_id);
+  f.caller(f.config.agent_id);
+  f.time(20001n * DAY_NS - 1n); f.tx();
   f.caller(f.config.agent_id);
   f.tx({ ...f.payment, token_id: "other.test.near" });
   assert.equal(f.spent(), "40000000");
@@ -199,4 +207,139 @@ test("invalid and rejected request IDs cannot reserve budget or poison a valid r
 test("UTC day lookup rejects trailing newline instead of reading a noncanonical key", () => {
   const f = fixture();
   assert.throws(() => getSpending(f.host, f.policy.token_id, "20000\n"), /bad_day/);
+});
+
+
+test("cap raise persists pending, rejects payment and activation until exact trusted deadline", () => {
+  const f = fixture(); f.tx(); f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" });
+  const pending = getPendingPolicy(f.host)!;
+  assert.equal(pending.activate_after, (20000n * DAY_NS + POLICY_DELAY_NS).toString());
+  f.reload(); f.caller(f.config.agent_id);
+  assert.throws(() => f.tx({ ...f.payment, amount: "60000000" }), /max_per_payment/);
+  f.time(BigInt(pending.activate_after) - 1n);
+  assert.throws(() => activatePolicy(f.host, pending.proposal_id), /policy_timelocked/);
+  assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
+  f.time(BigInt(pending.activate_after)); f.caller("stranger.near");
+  assert.throws(() => activatePolicy(f.host, "wrong"), /proposal_id_mismatch/);
+  activatePolicy(f.host, pending.proposal_id);
+  assert.equal(getPendingPolicy(f.host), null);
+  assert.throws(() => activatePolicy(f.host, pending.proposal_id), /no_pending_policy/);
+  f.caller(f.config.agent_id); f.tx({ ...f.payment, amount: "60000000" });
+  assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
+});
+
+test("mixed updates apply intersection immediately; queued policies cannot overwrite tightening", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000", daily_limit: "80000000",
+    recipients: ["bob.near"] });
+  const first = getPendingPolicy(f.host)!;
+  assert.deepEqual(getPolicy(f.host, f.policy.token_id), {
+    max_per_payment: "50000000", daily_limit: "80000000", recipients: [],
+  });
+  assert.throws(() => setPolicy(f.host, f.config, f.policy), /pending_policy_exists/);
+  assert.throws(() => setPolicy(f.host, f.config, { ...f.policy, token_id: "other.near" }), /pending_policy_exists/);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "10", daily_limit: "20", recipients: [] });
+  f.time(BigInt(first.activate_after));
+  assert.throws(() => activatePolicy(f.host, first.proposal_id), /no_pending_policy/);
+  setPolicy(f.host, f.config, f.policy);
+  const second = getPendingPolicy(f.host)!;
+  assert.notEqual(first.proposal_id, second.proposal_id);
+  assert.throws(() => activatePolicy(f.host, first.proposal_id), /proposal_id_mismatch/);
+  assert.throws(() => activatePolicy(f.host, second.proposal_id), /policy_timelocked/);
+});
+
+test("disable, re-enable, recipient additions and cancellations cannot bypass delay or erase spending", () => {
+  const f = fixture(); f.tx(); f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, recipients: [...f.policy.recipients, "bob.near"] });
+  assert.deepEqual(getPolicy(f.host, f.policy.token_id)!.recipients, f.policy.recipients);
+  const pending = getPendingPolicy(f.host)!;
+  disablePolicy(f.host, f.config, f.policy.token_id.toUpperCase());
+  assert.equal(getPolicy(f.host, f.policy.token_id), null);
+  assert.equal(f.spent(), "40000000");
+  setPolicy(f.host, f.config, f.policy);
+  assert.equal(getPolicy(f.host, f.policy.token_id), null);
+  assert.throws(() => activatePolicy(f.host, pending.proposal_id), /proposal_id_mismatch/);
+  const next = getPendingPolicy(f.host)!;
+  f.caller(f.config.agent_id);
+  assert.throws(() => f.tx(), /unknown_token/);
+  assert.throws(() => cancelPolicy(f.host, f.config), /owner_only/);
+  assert.throws(() => disablePolicy(f.host, f.config, f.policy.token_id), /owner_only/);
+  f.caller(f.config.owner_id); cancelPolicy(f.host, f.config);
+  f.time(BigInt(next.activate_after));
+  assert.throws(() => activatePolicy(f.host, next.proposal_id), /no_pending_policy/);
+  assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
+});
+
+test("partial policies reject; empty recipients tighten; public administration requires zero deposit", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  assert.throws(() => setPolicy(f.host, f.config, { token_id: f.policy.token_id } as any), /bad_amount/);
+  setPolicy(f.host, f.config, { ...f.policy, recipients: [] });
+  assert.equal(getPendingPolicy(f.host), null);
+  setPolicy(f.host, f.config, f.policy);
+  const pending = getPendingPolicy(f.host)!;
+  f.time(BigInt(pending.activate_after)); f.deposit(1n);
+  assert.throws(() => activatePolicy(f.host, pending.proposal_id), /zero_deposit_required/);
+  assert.throws(() => cancelPolicy(f.host, f.config), /zero_deposit_required/);
+  assert.throws(() => disablePolicy(f.host, f.config, f.policy.token_id), /zero_deposit_required/);
+  assert.throws(() => setPolicy(f.host, f.config, f.policy), /zero_deposit_required/);
+});
+
+test("comparison delays daily raises and recipient additions, including empty-token enablement", () => {
+  for (const update of [
+    { daily_limit: "200000000" },
+    { recipients: ["alice.test.near", "bob.near"] },
+    { max_per_payment: "10", recipients: ["bob.near"] },
+    { token_id: "new.near", recipients: [] },
+  ]) {
+    const f = fixture(); f.caller(f.config.owner_id);
+    setPolicy(f.host, f.config, { ...f.policy, ...update });
+    assert.ok(getPendingPolicy(f.host));
+  }
+  const f = fixture(); f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, recipients: ["ALICE.TEST.NEAR", "alice.test.near"] });
+  assert.equal(getPendingPolicy(f.host), null);
+});
+
+test("activation preserves spending already recorded on activation day and replay markers", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  f.time(20000n * DAY_NS + DAY_NS / 2n);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" });
+  const pending = getPendingPolicy(f.host)!;
+  f.time(20001n * DAY_NS); f.caller(f.config.agent_id);
+  f.tx({ ...f.payment, request_id: "before-activation" });
+  f.time(BigInt(pending.activate_after));
+  activatePolicy(f.host, pending.proposal_id);
+  assert.equal(f.spent(), "40000000");
+  assert.throws(() => f.tx({ ...f.payment, request_id: "before-activation" }), /duplicate_request/);
+  f.tx({ ...f.payment, amount: "60000000" });
+  assert.equal(f.spent(), "100000000");
+  assert.throws(() => f.tx({ ...f.payment, amount: "1" }), /daily_limit/);
+});
+
+test("cross-token tightening cancels pending enablement; re-proposal restarts the full delay", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  const target = { ...f.policy, token_id: "new.near" };
+  setPolicy(f.host, f.config, target);
+  const first = getPendingPolicy(f.host)!;
+  assert.equal(getPolicy(f.host, target.token_id), null);
+  f.time(BigInt(first.activate_after) - 1n);
+  assert.throws(() => activatePolicy(f.host, first.proposal_id), /policy_timelocked/);
+  // A restriction on another token must invalidate the global proposal too.
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "1" });
+  assert.equal(getPendingPolicy(f.host), null);
+  setPolicy(f.host, f.config, target);
+  const second = getPendingPolicy(f.host)!;
+  assert.equal(BigInt(second.activate_after), BigInt(first.activate_after) - 1n + POLICY_DELAY_NS);
+  assert.ok(BigInt(second.proposal_id) > BigInt(first.proposal_id));
+  f.reload(); f.time(BigInt(first.activate_after));
+  assert.throws(() => activatePolicy(f.host, first.proposal_id), /proposal_id_mismatch/);
+  assert.throws(() => activatePolicy(f.host, second.proposal_id), /policy_timelocked/);
+  assert.equal(getPolicy(f.host, target.token_id), null);
+  f.time(BigInt(second.activate_after));
+  activatePolicy(f.host, second.proposal_id);
+  assert.equal(getPolicy(f.host, f.policy.token_id)!.max_per_payment, "1");
+  assert.deepEqual(getPolicy(f.host, target.token_id), {
+    max_per_payment: target.max_per_payment, daily_limit: target.daily_limit, recipients: target.recipients,
+  });
 });

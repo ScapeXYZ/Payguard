@@ -1,6 +1,7 @@
 // Shared by the WASM contract and deterministic tests. All monetary values are u128.
 export const U128_MAX = (1n << 128n) - 1n;
 export const DAY_NS = 86_400_000_000_000n;
+export const POLICY_DELAY_NS = DAY_NS; // Fixed 24 hours; no configurable bypass.
 export const TRANSFER_GAS = 30_000_000_000_000n;
 export const MIN_PAY_GAS = 60_000_000_000_000n;
 export const MAX_PAY_GAS = 100_000_000_000_000n;
@@ -76,10 +77,61 @@ export function setPolicy(host: Host, config: Config, input: {
   requireThat(Array.isArray(input.recipients) && input.recipients.length <= 100, "bad_recipients");
   const recipients = [...new Set(input.recipients.map(accountId))];
   requireThat(!recipients.includes(host.currentAccount()), "self_payment_forbidden");
-  host.write("policy:" + token, JSON.stringify({
-    max_per_payment: cap.toString(), daily_limit: daily.toString(), recipients,
-  }));
-  // Reconfiguration never edits spending, including historical days.
+  const target: TokenPolicy = { max_per_payment: cap.toString(), daily_limit: daily.toString(), recipients };
+  const old = getPolicy(host, token);
+  const tightening = old !== null && cap <= BigInt(old.max_per_payment) &&
+    daily <= BigInt(old.daily_limit) && recipients.every(id => old.recipients.includes(id));
+  if (tightening) {
+    host.write("pending_policy", "null");
+    host.write("policy:" + token, JSON.stringify(target));
+    return;
+  }
+  requireThat(getPendingPolicy(host) === null, "pending_policy_exists");
+  // Apply the intersection now: mixed changes cannot postpone tightening.
+  if (old !== null) {
+    host.write("policy:" + token, JSON.stringify({
+      max_per_payment: (cap < BigInt(old.max_per_payment) ? cap : BigInt(old.max_per_payment)).toString(),
+      daily_limit: (daily < BigInt(old.daily_limit) ? daily : BigInt(old.daily_limit)).toString(),
+      recipients: old.recipients.filter(id => recipients.includes(id)),
+    }));
+  }
+  const proposal_id = (BigInt(host.read("policy_sequence") ?? "0") + 1n).toString();
+  host.write("policy_sequence", proposal_id);
+  host.write("pending_policy", JSON.stringify({ proposal_id, token_id: token, policy: target,
+    activate_after: (host.timestamp() + POLICY_DELAY_NS).toString() }));
+  // Never edit spending or request markers.
+}
+
+export type PendingPolicy = {
+  proposal_id: string; token_id: string; policy: TokenPolicy; activate_after: string;
+};
+
+export function getPendingPolicy(host: Host): PendingPolicy | null {
+  return JSON.parse(host.read("pending_policy") ?? "null");
+}
+
+export function cancelPolicy(host: Host, config: Config): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.owner_id, "owner_only");
+  host.write("pending_policy", "null");
+}
+
+export function disablePolicy(host: Host, config: Config, token: unknown): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.owner_id, "owner_only");
+  const id = accountId(token);
+  host.write("pending_policy", "null");
+  host.write("policy:" + id, "null");
+}
+
+export function activatePolicy(host: Host, proposalId: unknown): void {
+  zeroDeposit(host);
+  const pending = getPendingPolicy(host);
+  requireThat(pending !== null, "no_pending_policy");
+  requireThat(proposalId === pending.proposal_id, "proposal_id_mismatch");
+  requireThat(host.timestamp() >= BigInt(pending.activate_after), "policy_timelocked");
+  host.write("policy:" + pending.token_id, JSON.stringify(pending.policy));
+  host.write("pending_policy", "null");
 }
 
 export function getPolicy(host: Host, token: unknown): TokenPolicy | null {
