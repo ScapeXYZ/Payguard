@@ -33,6 +33,13 @@ test("blocks a token with no configured payment or daily limit", () => {
   assert.equal(d.allow, false, "a completely unconfigured token must not bypass spending limits");
 });
 
+test("blocks a token with a per-payment cap but no daily limit", () => {
+  const incompletePolicy: Policy = { ...policy, dailyLimit: {} };
+  const d = checkPayment({ to: "alice.near", amount: 50, token: "USDC" }, incompletePolicy);
+  assert.equal(d.allow, false, "a token must have both spending limits configured");
+  if (!d.allow) assert.equal(d.rule, "unknown_token");
+});
+
 test("blocks lowercase usdc above the configured USDC per-payment cap", () => {
   const d = checkPayment({ to: "alice.near", amount: 60, token: "usdc" }, policy);
   assert.equal(d.allow, false, "token casing must not bypass the configured USDC cap");

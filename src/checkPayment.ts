@@ -42,8 +42,8 @@ export function checkPayment(
   const limits = matchingAmounts(policy.dailyLimit);
   const max = maxima.length ? Math.min(...maxima) : undefined;
   const limit = limits.length ? Math.min(...limits) : undefined;
-  if (max === undefined && limit === undefined) {
-    return { allow: false, rule: "unknown_token", reason: `token ${p.token} has no configured per-payment cap or daily limit` };
+  if (max === undefined || limit === undefined) {
+    return { allow: false, rule: "unknown_token", reason: `token ${p.token} must have both a per-payment cap and a daily limit configured` };
   }
 
   // rule 2: max per payment
