@@ -29,8 +29,10 @@ tool installers explicitly through `setup:tools`. Dependencies are pinned in the
 lockfile; subsequent installations can use `npm ci --ignore-scripts`.
 
 `test:sandbox` explicitly selects Sandbox, never a public network. It funds the
-guard with fake six-decimal USDC, installs a restricted key, and sends three
-separate signed payments of `"40000000"` units against `"100000000"` daily:
+guard with fake six-decimal USDC, deletes all three guard keys through a signed
+account-action batch, verifies the empty RPC key list, and sends three
+separate signed payments using the agent's sole restricted key, each of
+`"40000000"` units against `"100000000"` daily:
 the first two transfer tokens; the third rejects with `daily_limit`. It also
 tests caller/key restrictions, policy authentication, bad inputs, failed
 cross-contract transfers, and rollover. `tests/mock-ft.ts` is a minimal local
@@ -119,10 +121,10 @@ handles a missing/failed callback because no callback exists.
 These are setup instructions, not actions performed by the test suite. Use only
 testnet accounts and valueless test tokens; no mainnet deployment is included.
 
-1. Create separate owner and agent accounts. Keep all full-access credentials
-   with the trusted operator. In **one transaction action batch signed by owner**,
-   receiver a new child guard account: create account, fund storage, optionally
-   add an operator-only full-access key, deploy `build/guard.wasm`, and call `init`
+1. Create separate owner and agent accounts. Keep setup full-access credentials
+   with the trusted operator until their on-chain retirement. In **one transaction action batch signed by owner**,
+   receiver a new child guard account: create account, fund storage,
+   add a temporary operator-only full-access key, deploy `build/guard.wasm`, and call `init`
    with `{owner_id, agent_id}` and zero deposit. The Sandbox fixture demonstrates
    this sequence. Do not deploy uninitialized code publicly: an attacker could
    claim it by naming themselves owner. A separate owner cannot deploy arbitrary
@@ -144,7 +146,16 @@ testnet accounts and valueless test tokens; no mainnet deployment is included.
    method; omitted/unlimited allowance is inappropriate. Sign agent transactions
    with zero deposit and 80 Tgas. The key cannot transfer native NEAR, attach
    deposits, deploy code, add keys, call token contracts, or call owner methods.
-   Revoke it using the operator-held full-access key when compromised or unused.
+   After verifying it, retire every other agent key with agent-signed `DeleteKey`
+   actions, leaving exactly this function-call key. This also removes direct agent
+   key rotation/recovery: replace the deployment if the key is lost or exhausted.
+5. Complete the verification and **irreversible guard lock** in
+   [the exact key-management runbook](docs/key-management.md). Enumerate every
+   on-chain guard key and delete all of them, including function-call keys and
+   the signing full-access key, using guard-signed account actions. Confirm the
+   finalized RPC key list is empty before treating this deployment as locked.
+   Any real-network deletion requires separate explicit operator confirmation;
+   the repository tests perform deletion only on local Sandbox accounts.
 
 Function-call allowance limits cumulative gas fees, **not token spending**, and
 does not encode a per-call gas cap. PayGuard additionally enforces 60–100 Tgas
@@ -157,9 +168,11 @@ and [asynchronous cross-contract calls](https://docs.near.org/smart-contracts/an
 
 ## Security boundaries and limitations
 
-The owner is trusted to change policy; any retained guard-account full-access
-key holder is trusted to replace code. The agent must never receive those keys or
-control another funded execution path. Only tokens held by the guard are covered.
+The owner is trusted to change policy. Before locking, guard-account full-access
+key holders can replace code or bypass the guard; after the required zero-key
+lock, this contract has no code upgrade, key recovery, or state reset path.
+The agent must never receive setup full-access keys or control another funded
+execution path. Only tokens held by the guard are covered.
 No native NEAR payments, swaps, arbitrary contract calls, dynamic agent rotation,
 automated refunds, or storage cleanup are implemented. Replacing the deployment
 or using another funded guard starts a different authorization scope.
