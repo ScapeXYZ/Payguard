@@ -12,6 +12,12 @@ class MockFt {
     return NearPromise.new(guard_id).functionCall("pay", JSON.stringify(payment), 0n, 80_000_000_000_000n);
   }
 
+  // Test-only identity relay proves signer authority is not inherited.
+  @call({})
+  forward_identity({ guard_id, method, args }: { guard_id: string; method: string; args: Record<string, string> }): NearPromise {
+    return NearPromise.new(guard_id).functionCall(method, JSON.stringify(args), 0n, 30_000_000_000_000n);
+  }
+
   @initialize({})
   init({ owner_id, total_supply }: { owner_id: string; total_supply: string }): void {
     requireThat(near.predecessorAccountId() === owner_id, "owner_only");

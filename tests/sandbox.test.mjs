@@ -280,6 +280,7 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
   await f.owner.call(f.guard, "cancel_owner_recovery", {});
   assert.equal(await f.guard.view("get_pending_owner_recovery"), null);
+  await assert.rejects(f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId }), /recovery_cooldown/);
   assert.deepEqual(await f.guard.view("get_config"), config);
   assert.deepEqual(await f.guard.view("get_policy", { token_id: f.token.accountId }), activePolicy);
   assert.equal((await f.spending({ day: spent.day })).spent, spent.spent);
@@ -288,10 +289,10 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   assert.ok(await f.guard.view("get_pending_policy"));
   for (let jumps = 0; jumps < 40; jumps++) {
     const block = await f.worker.provider.block({ finality: "final" });
-    if (BigInt(block.header.timestamp_nanosec) >= BigInt(canceled.activate_after)) break;
+    if (BigInt(block.header.timestamp_nanosec) >= BigInt(await f.guard.view("get_recovery_cooldown"))) break;
     await f.worker.provider.fastForward(1_000_000);
   }
-  assert.ok(BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(canceled.activate_after));
+  assert.ok(BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(await f.guard.view("get_recovery_cooldown")));
   await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: canceled.proposal_id }), /no_pending_identity/);
   const beforeProposal = await f.worker.provider.block({ finality: "final" });
   await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
@@ -321,4 +322,43 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   await assert.rejects(f.pay(), /daily_limit/);
   assert.deepEqual((await f.guard.viewAccessKeys(f.guard.accountId)).keys, []);
   await assert.rejects(f.agent.call(f.guard, "propose_owner_recovery", { owner_id: f.owner.accountId }, f.options), { type: "MethodNameMismatch" });
+});
+
+test("Sandbox: owner replaces hostile guardian despite recovery and invalidates its queued takeover", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  const next = await f.owner.createSubAccount("newguardian", { initialBalance: 10n ** 24n });
+  await assert.rejects(f.stranger.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId }), /owner_or_guardian_only/);
+  for (const caller of [f.owner, f.guardian]) {
+    await assert.rejects(caller.call(f.token, "forward_identity", {
+      guard_id: f.guard.accountId, method: "propose_guardian_change", args: { guardian_id: next.accountId },
+    }, { gas: 100_000_000_000_000n }), /owner_or_guardian_only/);
+  }
+  await assert.rejects(f.guardian.call(f.token, "forward_identity", {
+    guard_id: f.guard.accountId, method: "propose_owner_recovery", args: { owner_id: f.stranger.accountId },
+  }, { gas: 100_000_000_000_000n }), /guardian_only/);
+  await f.guardian.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId });
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const recovery = await f.guard.view("get_pending_owner_recovery");
+  const before = await f.worker.provider.block({ finality: "final" });
+  await f.owner.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId });
+  const p = await f.guard.view("get_pending_guardian_change");
+  assert.ok(BigInt(p.activate_after) >= BigInt(before.header.timestamp_nanosec) + 86_400_000_000_000n);
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: p.proposal_id }), /identity_timelocked/);
+  await assert.rejects(f.guardian.call(f.guard, "propose_guardian_change", { guardian_id: f.stranger.accountId }), /owner_guardian_change_pending/);
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const latest = await f.guard.view("get_pending_owner_recovery");
+  assert.deepEqual(await f.guard.view("get_pending_guardian_change"), p);
+  for (let jumps = 0; jumps < 40; jumps++) {
+    const block = await f.worker.provider.block({ finality: "final" });
+    if (BigInt(block.header.timestamp_nanosec) >= BigInt(p.activate_after)) break;
+    await f.worker.provider.fastForward(1_000_000);
+  }
+  assert.ok(BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(p.activate_after));
+  await f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: p.proposal_id });
+  assert.equal((await f.guard.view("get_config")).guardian_id, next.accountId);
+  await assert.rejects(f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId }), /guardian_only/);
+  await assert.rejects(f.guardian.call(f.guard, "cancel_policy", {}), /owner_or_guardian_only/);
+  for (const old of [recovery, latest]) await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: old.proposal_id }), /no_pending_identity/);
+  await next.call(f.guard, "cancel_policy", {});
+  await next.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
 });
