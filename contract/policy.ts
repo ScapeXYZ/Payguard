@@ -231,6 +231,13 @@ export function cancelOwnerRecovery(host: Host, config: Config): void {
 export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
   proposeIdentity(host, config, replacement, false);
 }
+// Immediate veto by the active guardian, including owner proposals and mature changes.
+// Preserve sequence, recovery, cooldown and payment state; canceled IDs stay invalid.
+export function cancelGuardianChange(host: Host, config: Config): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+  host.write("pending_guardian_change", "null");
+}
 function activateIdentity(host: Host, config: Config, proposalId: unknown, recovery: boolean): void {
   zeroDeposit(host);
   const pending = recovery ? getPendingOwnerRecovery(host) : getPendingGuardianChange(host);

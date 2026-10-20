@@ -206,7 +206,7 @@ a stranger and verify actual FT balances using the restricted agent after expiry
   `get_config`, `get_policy`, `get_spending`, `get_pending_policy`,
   `activate_policy`, `cancel_policy`, `disable_policy`, `propose_owner_recovery`,
   `get_pending_owner_recovery`, `cancel_owner_recovery`, `activate_owner_recovery`, `propose_guardian_change`,
-  `get_pending_guardian_change`, `activate_guardian_change`, `get_recovery_cooldown`. The views do not write state or
+  `get_pending_guardian_change`, `cancel_guardian_change`, `activate_guardian_change`, `get_recovery_cooldown`. The views do not write state or
   schedule calls. No raw transfer, arbitrary call, reset or callback is exported.
   The agent key permits only `pay`; even a key configuration mistake would still
   face contract ACLs. The zero-key guard has no account-key escape or self-upgrade method.
@@ -274,7 +274,13 @@ activation during cooldown, full-delay replacement supersession, owner proposal
 priority, recovery/replacement mutual invalidation, old guardian revocation and
 new guardian permissions. Sandbox relays identity calls with owner/guardian as
 signer through the mock FT and verifies predecessor-based rejection. The production
-export allowlist adds only the read-only `get_recovery_cooldown` method.
+export allowlist includes `get_recovery_cooldown` and guardian-only `cancel_guardian_change`.
+Guardian-change veto coverage verifies owner-proposed cancellation, rejection before
+and after the original deadline, fresh full-delay proposals, retained current-guardian
+authority, former-guardian rejection, zero deposit, and preservation of pending recovery,
+cooldown, policy, spending and replay protection. Deterministic tests compare every
+storage entry; Sandbox tests use real predecessor calls and reject a guardian-signed
+relay whose predecessor is the mock FT.
 
 
 ## Guardian and owner recovery lifecycle
@@ -323,10 +329,19 @@ Current-owner-or-guardian `propose_guardian_change({guardian_id})`,
 `get_pending_guardian_change()` and permissionless
 `activate_guardian_change({proposal_id})` provide succession with a fixed full
 24-hour delay. Each superseding proposal gets a fresh ID and deadline. The pending
-view adds `owner_proposed` (boolean). Owner proposals take priority: a guardian
+view adds `owner_proposed` (boolean). Owner proposals take priority over competing proposals: a guardian
 cannot overwrite one (`owner_guardian_change_pending`), and recovery proposals
 cannot erase one. The owner can propose during pending recovery. Guardian-initiated
 changes remain blocked during recovery and are cleared when recovery starts.
+Current-guardian-only `cancel_guardian_change()` authenticates through NEAR
+`predecessor_account_id` and requires zero attached deposit. It immediately clears
+any pending guardian replacement, including owner proposals, even after maturity.
+Activation then fails with `no_pending_identity`, including after the original
+deadline. Cancellation changes no active identity, policy, spending, replay marker,
+pending owner recovery or recovery cooldown. With no pending change it is a no-op.
+The owner or current guardian can propose again under the existing rules; every
+fresh proposal has a new ID and a fresh full 24-hour delay.
+
 Activation of a valid guardian change is allowed despite pending recovery and
 clears that recovery atomically. The displaced guardian immediately loses all
 guardian permissions; its queued recovery can never activate afterward.
@@ -340,8 +355,9 @@ predecessor, never signer; no caller-supplied time or delay is accepted.
 
 Use separately controlled owner and guardian accounts with independent monitoring.
 A compromised guardian can veto policy and freeze loosening until the owner
-responds, but cannot repeatedly propose recovery during the veto cooldown or
-prevent an owner-proposed replacement from maturing. If recovery activates before
+responds. It can also veto legitimate owner attempts to replace it, potentially
+indefinitely. This change does not solve compromised-guardian recovery. It cannot
+repeatedly propose owner recovery during the owner-veto cooldown. If recovery activates before
 the owner responds, the old owner loses authority. A compromised owner can veto
 legitimate recovery and queue guardian removal; this design cannot distinguish
 key theft from legitimate control. Lost guardian keys no longer block owner-led

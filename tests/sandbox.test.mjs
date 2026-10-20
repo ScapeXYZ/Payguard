@@ -324,7 +324,7 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   await assert.rejects(f.agent.call(f.guard, "propose_owner_recovery", { owner_id: f.owner.accountId }, f.options), { type: "MethodNameMismatch" });
 });
 
-test("Sandbox: owner replaces hostile guardian despite recovery and invalidates its queued takeover", { timeout: 600000 }, async (t) => {
+test("Sandbox: unvetoed owner replacement despite recovery invalidates queued takeover", { timeout: 600000 }, async (t) => {
   const f = await fixture(t);
   const next = await f.owner.createSubAccount("newguardian", { initialBalance: 10n ** 24n });
   await assert.rejects(f.stranger.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId }), /owner_or_guardian_only/);
@@ -361,4 +361,62 @@ test("Sandbox: owner replaces hostile guardian despite recovery and invalidates 
   for (const old of [recovery, latest]) await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: old.proposal_id }), /no_pending_identity/);
   await next.call(f.guard, "cancel_policy", {});
   await next.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+});
+
+test("Sandbox: current guardian veto uses predecessor and preserves recovery, ledger and full replacement delay", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  const next = await f.owner.createSubAccount("veto-next", { initialBalance: 10n ** 24n });
+  const waitUntil = async (deadline) => {
+    for (let jumps = 0; jumps < 40; jumps++) {
+      if (BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(deadline)) return;
+      await f.worker.provider.fastForward(1_000_000);
+    }
+    assert.fail("Sandbox clock did not reach deadline");
+  };
+  await f.pay({ ...f.payment, request_id: "guardian-veto-ledger" });
+  const spent = await f.spending();
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  await f.owner.call(f.guard, "cancel_owner_recovery", {});
+  const cooldown = await f.guard.view("get_recovery_cooldown");
+  await waitUntil(cooldown);
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const recovery = await f.guard.view("get_pending_owner_recovery");
+  await f.owner.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId });
+  const first = await f.guard.view("get_pending_guardian_change");
+  const config = await f.guard.view("get_config");
+  const policy = await f.guard.view("get_policy", { token_id: f.token.accountId });
+  for (const caller of [f.owner, f.stranger, next]) {
+    await assert.rejects(caller.call(f.guard, "cancel_guardian_change", {}), /guardian_only/);
+  }
+  await assert.rejects(f.agent.call(f.guard, "cancel_guardian_change", {}, f.options), { type: "MethodNameMismatch" });
+  await assert.rejects(f.guardian.call(f.token, "forward_identity", {
+    guard_id: f.guard.accountId, method: "cancel_guardian_change", args: {},
+  }, { gas: 100_000_000_000_000n }), /guardian_only/);
+  await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}, { attachedDeposit: 1n }));
+  assert.deepEqual(await f.guard.view("get_pending_guardian_change"), first);
+  await f.guardian.call(f.guard, "cancel_guardian_change", {});
+  assert.equal(await f.guard.view("get_pending_guardian_change"), null);
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /no_pending_identity/);
+  await waitUntil(first.activate_after);
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /no_pending_identity/);
+  assert.deepEqual(await f.guard.view("get_config"), config);
+  assert.deepEqual(await f.guard.view("get_pending_owner_recovery"), recovery);
+  assert.equal(await f.guard.view("get_recovery_cooldown"), cooldown);
+  assert.deepEqual(await f.guard.view("get_policy", { token_id: f.token.accountId }), policy);
+  assert.equal((await f.spending({ day: spent.day })).spent, spent.spent);
+  await assert.rejects(f.pay({ ...f.payment, request_id: "guardian-veto-ledger" }), /duplicate_request/);
+  await f.guardian.call(f.guard, "cancel_policy", {});
+  const before = await f.worker.provider.block({ finality: "final" });
+  await f.owner.call(f.guard, "propose_guardian_change", { guardian_id: next.accountId });
+  const fresh = await f.guard.view("get_pending_guardian_change");
+  assert.ok(BigInt(fresh.proposal_id) > BigInt(first.proposal_id));
+  assert.ok(BigInt(fresh.activate_after) >= BigInt(before.header.timestamp_nanosec) + 86_400_000_000_000n);
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: fresh.proposal_id }), /identity_timelocked/);
+  await waitUntil(fresh.activate_after);
+  await f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: fresh.proposal_id });
+  assert.equal(await f.guard.view("get_pending_owner_recovery"), null);
+  await next.call(f.guard, "propose_guardian_change", { guardian_id: f.stranger.accountId });
+  await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /guardian_only/);
+  await next.call(f.guard, "cancel_guardian_change", {});
+  assert.equal(await f.guard.view("get_pending_guardian_change"), null);
 });
