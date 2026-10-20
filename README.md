@@ -39,9 +39,11 @@ cross-contract transfers, and rollover. `tests/mock-ft.ts` is a minimal local
 transfer fixture, **not a production token implementation**.
 Deterministic tests execute the same policy functions as the contract using
 controlled host storage/time; they do not substitute for WASM/Sandbox validation.
-The Sandbox UTC rollover test can take several minutes while advancing the
-local chain; its timeout is ten minutes. Exact midnight boundaries are also
-covered by the fast deterministic tests.
+Sandbox fixtures configure long epochs in local genesis before the node starts
+so day-long `fastForward` jumps avoid expensive epoch transitions. Tests observe
+actual finalized block timestamps; neither contract state nor the 24-hour delay
+is patched. Each scenario has a ten-minute timeout. Exact timestamp boundaries
+are also covered by the fast deterministic tests.
 
 ## Contract API and accounting
 
@@ -49,15 +51,52 @@ covered by the fast deterministic tests.
   agent, and guard must be separate accounts. Create/deploy/initialize together
   as described below to prevent an initialization takeover.
 - `set_policy({token_id, max_per_payment, daily_limit, recipients})`: owner-only,
-  zero deposit. Sets both positive u128 limits together; cap cannot exceed daily
+  zero deposit. Submits a full token policy under the timelock lifecycle below.
+  Sets both positive u128 limits together; cap cannot exceed daily
   limit. At most 100 recipients. Empty recipients pauses the token. Existing
   spending is never reset, even after reconfiguration or lowering limits.
   Changes govern new authorizations; they cannot cancel previously scheduled transfers.
+- `disable_policy({token_id})`: owner-only, zero deposit; immediately disables the
+  token and cancels any pending proposal, preserving all spending.
+- `cancel_policy()`: owner-only, zero deposit; clears the pending proposal.
+- `activate_policy({proposal_id})`: permissionless, zero deposit; activates only
+  the exact current proposal after its on-chain deadline, then clears it.
+- `get_pending_policy()`: view returning `null` or
+  `{proposal_id, token_id, policy, activate_after}`; IDs and nanosecond timestamps
+  are decimal strings. `get_policy` returns only the active policy.
 - `pay({request_id, token_id, recipient_id, amount})`: configured agent **predecessor** only,
   zero deposit, 60–100 Tgas prepaid (use 80 Tgas). Returns the transfer promise.
 - Read-only `get_config`, `get_policy({token_id})`, and
   `get_spending({token_id, day?})`. Day is a decimal UTC epoch-day string;
   omitted day uses current block timestamp.
+
+### Policy timelock lifecycle
+
+The fixed delay is **24 hours** (`86400000000000` nanoseconds), measured from
+NEAR's trusted block timestamp. No public method can configure or skip it.
+Both initial token enablement and re-enablement require this delay. Submit
+`set_policy`, inspect `get_pending_policy`, wait until `activate_after`, then
+call `activate_policy` with that proposal's ID. Expiry alone does not activate it.
+Any account may activate; it cannot supply a replacement policy or deadline.
+Owner and agent identities remain immutable; there is no agent-change method.
+
+A full replacement is immediate only if both limits are no higher and every
+recipient was already approved. Duplicates/casing are normalized before comparison.
+Missing fields reject; partial patches are unsupported. Empty recipients pause
+payments immediately when limits do not increase. For mixed changes, the active
+policy immediately takes the minimum of each old/new cap and the intersection of
+recipients; the full requested policy waits. Any increase, added recipient, or
+new/disabled token is conservatively delayed, even if its recipient set is empty.
+
+Only one proposal can be pending across all tokens. Another loosening/mixed update
+rejects atomically with `pending_policy_exists`; cancel first to propose anew,
+which starts a fresh full delay and new monotonically increasing ID. An immediate
+non-loosening update (including an identical policy) or token disable cancels any
+pending proposal globally. This prevents an older queued change from undoing
+later tightening. Activation with an old ID fails, even if a new proposal exists.
+Cancellation never rolls back the tightening portion of a mixed update.
+No lifecycle operation changes current or historical spending or replay markers.
+Changes affect new authorizations, not transfers already scheduled.
 
 Amounts are canonical positive decimal **strings in smallest units**, bounded by
 u128; JSON numbers, decimals, exponent notation, signs and leading zeros reject.
@@ -130,7 +169,8 @@ testnet accounts and valueless test tokens; no mainnet deployment is included.
    claim it by naming themselves owner. A separate owner cannot deploy arbitrary
    code onto an existing account; the creation batch establishes this authority.
 2. Owner calls `set_policy` with verified testnet token contract IDs, decimal
-   integer limits and approved account IDs. Register guard and recipient accounts
+   integer limits and approved account IDs. Inspect the pending proposal, wait
+   the full 24 hours, activate its ID, and verify the active policy. Register guard and recipient accounts
    via the token's `storage_deposit` using trusted funds. Transfer test tokens to
    guard via `ft_transfer`. Fund guard with enough test NEAR for code/storage and
    outgoing 1 yoctoNEAR deposits. The agent account holds gas funds only.
@@ -168,7 +208,14 @@ and [asynchronous cross-contract calls](https://docs.near.org/smart-contracts/an
 
 ## Security boundaries and limitations
 
-The owner is trusted to change policy. Before locking, guard-account full-access
+An owner compromise can immediately pause/restrict payments or cancel proposals
+(denial of service). It can loosen policy only after the 24-hour delay; monitoring
+and an owner-authorized cancellation/tightening response are required during that
+window. There is no independent guardian, owner rotation, or automatic veto. An
+attacker retaining owner authority can re-propose and eventually activate malicious
+changes, including malicious tokens/recipients. The delay does not protect funds
+after that deadline, recover a compromised key, or stop payments already allowed
+by the active policy. Before locking, guard-account full-access
 key holders can replace code or bypass the guard; after the required zero-key
 lock, this contract has no code upgrade, key recovery, or state reset path.
 The agent must never receive setup full-access keys or control another funded

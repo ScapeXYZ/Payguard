@@ -26,7 +26,10 @@ or credential loader and tests use only ephemeral Sandbox accounts.
    then `FunctionCall("init", {owner_id, agent_id}, 30 Tgas, 0)`.
    Never expose a deployed but uninitialized guard.
 3. Verify finalized code hash and `get_config`. Owner signs `set_policy` to guard
-   with zero deposit. Verify `get_policy` and `get_spending`. Register guard and
+   with zero deposit. Inspect `get_pending_policy`; initial token enablement waits
+   24 hours of block time. Call `activate_policy({proposal_id})` after its deadline
+   (permissionless, zero deposit), then verify `get_policy` and `get_spending`.
+   There is no setup exemption. Register guard and
    recipients on the intended token; fund guard with the intended test tokens
    and sufficient native storage/deposit balance. Test owner authorization and
    agent payments before making the lock irreversible.
@@ -85,7 +88,12 @@ For this exact deployed code, the guard lock is irreversible: there is no method
 that schedules `AddKey`, `DeployContract`, `DeleteAccount`, native withdrawals, or
 state resets. Keeping a deleted private key or owning the parent account cannot
 restore authority. The owner can still adjust policy, including pausing via an
-empty recipient list, but cannot replace code, rotate the immutable owner/agent,
+empty recipient list or `disable_policy`. Loosening waits a fixed 24 hours;
+any immediate tightening invalidates pending proposals globally. Monitor
+`get_pending_policy` and use owner-only `cancel_policy` to cancel unwanted
+proposals during the response window. A persistent owner compromise can cause
+denial of service or eventually activate malicious policy; no independent veto
+exists. The owner cannot replace code, rotate the immutable owner/agent,
 clear spending/request markers, or recover arbitrary assets. Keyless accounts
 with self-upgrade/recovery code would have different guarantees; verify the code.
 

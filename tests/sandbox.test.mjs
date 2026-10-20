@@ -2,8 +2,36 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "near-workspaces";
 import { KeyPair, transactions } from "near-api-js";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { SandboxServer } from "near-workspaces/dist/server/server.js";
 import { lockGuard } from "../scripts/lock-guard.mjs";
+
+// Test-only genesis tuning, before the node starts or any account is created.
+// Long epochs make day-long fastForward jumps cheap. This changes neither the
+// contract delay nor its block clock and never patches deployed contract state.
+const initSandbox = SandboxServer.init.bind(SandboxServer);
+SandboxServer.init = async (config) => {
+  const server = await initSandbox(config);
+  const path = `${server.homeDir}/genesis.json`;
+  const genesis = JSON.parse(await readFile(path, "utf8"));
+  genesis.epoch_length = 1_000_000;
+  await writeFile(path, JSON.stringify(genesis));
+  return server;
+};
+
+// Advance real Sandbox blocks; never patch contract state or supply a clock.
+async function activatePending(worker, caller, guard) {
+  const pending = await guard.view("get_pending_policy");
+  assert.ok(pending);
+  for (let jumps = 0; jumps < 40; jumps++) {
+    const block = await worker.provider.block({ finality: "final" });
+    if (BigInt(block.header.timestamp_nanosec) >= BigInt(pending.activate_after)) break;
+    await worker.provider.fastForward(1_000_000);
+  }
+  const block = await worker.provider.block({ finality: "final" });
+  assert.ok(BigInt(block.header.timestamp_nanosec) >= BigInt(pending.activate_after));
+  await caller.call(guard, "activate_policy", { proposal_id: pending.proposal_id });
+}
 
 // Explicit network avoids environment-driven testnet selection. No public RPCs.
 async function fixture(t) {
@@ -37,6 +65,7 @@ async function fixture(t) {
   await owner.call(token, "ft_transfer", { receiver_id: guard.accountId, amount: "500000000" }, { attachedDeposit: 1n });
   const policy = { token_id: token.accountId, max_per_payment: "50000000", daily_limit: "100000000", recipients: [alice.accountId] };
   await owner.call(guard, "set_policy", policy);
+  await activatePending(worker, owner, guard);
 
   const restricted = KeyPair.fromRandom("ed25519");
   const allowance = 10n ** 24n; // Finite 1 NEAR gas budget, local fake funds only.
@@ -85,6 +114,7 @@ async function fixture(t) {
   await owner.call(guard, "set_policy", { ...policy, max_per_payment: "45000000" });
   assert.equal((await guard.view("get_policy", { token_id: token.accountId })).max_per_payment, "45000000");
   await owner.call(guard, "set_policy", policy);
+  await activatePending(worker, stranger, guard);
   assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId });
   const payment = { token_id: token.accountId, recipient_id: alice.accountId, amount: "40000000" };
   const options = { gas: 80_000_000_000_000n, attachedDeposit: 0n, signWithKey: restricted };
@@ -96,7 +126,7 @@ async function fixture(t) {
   };
 }
 
-test("Sandbox: deletes every guard key then three signed 40 USDC transactions reject third", { timeout: 180000 }, async (t) => {
+test("Sandbox: deletes every guard key then three signed 40 USDC transactions reject third", { timeout: 600000 }, async (t) => {
   const f = await fixture(t);
   await f.pay();
   assert.equal(await f.balance(f.alice), "40000000");
@@ -116,7 +146,7 @@ test("Sandbox: deletes every guard key then three signed 40 USDC transactions re
     { type: "RequiresFullAccess" });
 });
 
-test("Sandbox: predecessor authorization, owner policy, input validation, and no reset methods", { timeout: 180000 }, async (t) => {
+test("Sandbox: predecessor authorization, owner policy, input validation, and no reset methods", { timeout: 600000 }, async (t) => {
   const f = await fixture(t);
   for (const caller of [f.owner, f.stranger]) {
     await assert.rejects(caller.call(f.guard, "pay", f.payment, { gas: f.options.gas }), /agent_only/);
@@ -148,6 +178,7 @@ test("Sandbox: failed ft_transfer leaves reservation and funds; UTC day rollover
   const f = await fixture(t);
   // Stranger is deliberately unregistered on the FT, but approved in guard policy.
   await f.owner.call(f.guard, "set_policy", { ...f.policy, recipients: [f.stranger.accountId] });
+  await activatePending(f.worker, f.stranger, f.guard);
   const original = await f.spending();
   const fail = { ...f.payment, recipient_id: f.stranger.accountId };
   await assert.rejects(f.pay(fail), /recipient_not_registered/);
@@ -157,11 +188,11 @@ test("Sandbox: failed ft_transfer leaves reservation and funds; UTC day rollover
   assert.equal((await f.spending()).spent, "80000000");
   assert.equal(await f.balance(f.guard), "500000000");
   await assert.rejects(f.pay(fail), /daily_limit/);
-  // Sandbox time jumps can be slow across many epochs. Observe the actual
-  // contract clock between small jumps and stop as soon as UTC day changes.
+  // Cross a long test epoch and observe the actual contract clock. Stop
+  // as soon as the UTC day changes; never infer elapsed time from height.
   let next = await f.spending();
   for (let jumps = 0; next.day === original.day && jumps < 40; jumps++) {
-    await f.worker.provider.fastForward(5000);
+    await f.worker.provider.fastForward(1_000_000);
     next = await f.spending();
   }
   assert.ok(BigInt(next.day) > BigInt(original.day));
@@ -169,11 +200,12 @@ test("Sandbox: failed ft_transfer leaves reservation and funds; UTC day rollover
   assert.equal((await f.spending({ day: original.day })).spent, "80000000");
   await assert.rejects(f.pay({ ...fail, request_id: "sandbox-1" }), /duplicate_request/);
   await f.owner.call(f.guard, "set_policy", f.policy);
+  await activatePending(f.worker, f.stranger, f.guard);
   await f.pay();
   assert.equal(await f.balance(f.alice), "40000000");
 });
 
-test("Sandbox: duplicate requests cannot pay twice or change payload to reuse an ID", { timeout: 180000 }, async (t) => {
+test("Sandbox: duplicate requests cannot pay twice or change payload to reuse an ID", { timeout: 600000 }, async (t) => {
   const f = await fixture(t);
   const payment = { ...f.payment, request_id: "invoice-1" };
   await assert.rejects(f.owner.call(f.token, "forward_pay", {
@@ -189,4 +221,35 @@ test("Sandbox: duplicate requests cannot pay twice or change payload to reuse an
   await assert.rejects(f.pay({ ...payment, request_id: "invoice-1\n" }), /bad_request_id/);
   await assert.rejects(f.pay({ ...f.payment, token_id: f.token.accountId + "\n" }), /bad_account_id/);
   await assert.rejects(f.pay({ ...f.payment, amount: "1\n" }), /bad_amount/);
+});
+
+
+test("Sandbox: owner cap raise cannot pay or activate early; exact pending policy activates after 24 hours", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  await f.pay();
+  const oldSpending = await f.spending();
+  await f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" });
+  const pending = await f.guard.view("get_pending_policy");
+  const block = await f.worker.provider.block({ finality: "final" });
+  assert.ok(BigInt(pending.activate_after) > BigInt(block.header.timestamp_nanosec));
+  assert.equal((await f.guard.view("get_policy", { token_id: f.token.accountId })).max_per_payment, "50000000");
+  await assert.rejects(f.pay({ ...f.payment, amount: "60000000" }), /max_per_payment/);
+  for (const caller of [f.owner, f.stranger]) {
+    await assert.rejects(caller.call(f.guard, "activate_policy", { proposal_id: pending.proposal_id }), /policy_timelocked/);
+  }
+  await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "70000000" }), /pending_policy_exists/);
+  assert.equal((await f.spending({ day: oldSpending.day })).spent, "40000000");
+  await activatePending(f.worker, f.stranger, f.guard);
+  assert.equal((await f.guard.view("get_policy", { token_id: f.token.accountId })).max_per_payment, "60000000");
+  await f.pay({ ...f.payment, amount: "60000000" });
+  assert.equal(await f.balance(f.alice), "100000000");
+  assert.equal((await f.spending({ day: oldSpending.day })).spent, "40000000");
+  await assert.rejects(f.owner.call(f.guard, "activate_policy", { proposal_id: pending.proposal_id }), /no_pending_policy/);
+  // Later tightening invalidates a queued recipient/cap expansion on the keyless guard.
+  await f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "70000000", recipients: [f.alice.accountId, f.stranger.accountId] });
+  const stale = await f.guard.view("get_pending_policy");
+  await f.owner.call(f.guard, "disable_policy", { token_id: f.token.accountId });
+  assert.equal(await f.guard.view("get_pending_policy"), null);
+  await assert.rejects(f.stranger.call(f.guard, "activate_policy", { proposal_id: stale.proposal_id }), /no_pending_policy/);
+  await assert.rejects(f.pay(), /unknown_token/);
 });

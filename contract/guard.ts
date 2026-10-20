@@ -1,6 +1,7 @@
 import { NearBindgen, near, call, view, initialize, NearPromise } from "near-sdk-js";
 import {
   initialize as initializeConfig, setPolicy, reserve, getPolicy, getSpending, dayAt, TRANSFER_GAS,
+  activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
   type Host, type Payment,
 } from "./policy";
 
@@ -30,6 +31,18 @@ class PayGuard {
   set_policy(input: { token_id: string; max_per_payment: string; daily_limit: string; recipients: string[] }): void {
     setPolicy(host, this, input);
   }
+
+  @call({})
+  activate_policy({ proposal_id }: { proposal_id: string }): void { activatePolicy(host, proposal_id); }
+
+  @call({})
+  cancel_policy(): void { cancelPolicy(host, this); }
+
+  @call({})
+  disable_policy({ token_id }: { token_id: string }): void { disablePolicy(host, this, token_id); }
+
+  @view({})
+  get_pending_policy() { return getPendingPolicy(host); }
 
   @call({})
   pay(input: Payment): NearPromise {
