@@ -2,6 +2,8 @@ import { NearBindgen, near, call, view, initialize, NearPromise } from "near-sdk
 import {
   initialize as initializeConfig, setPolicy, reserve, getPolicy, getSpending, dayAt, TRANSFER_GAS,
   activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
+  proposeOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
+  proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
   type Host, type Payment,
 } from "./policy";
 
@@ -19,12 +21,14 @@ const host: Host = {
 class PayGuard {
   owner_id = "";
   agent_id = "";
+  guardian_id = "";
 
   @initialize({})
-  init({ owner_id, agent_id }: { owner_id: string; agent_id: string }): void {
-    const config = initializeConfig(host, owner_id, agent_id);
+  init({ owner_id, agent_id, guardian_id }: { owner_id: string; agent_id: string; guardian_id: string }): void {
+    const config = initializeConfig(host, owner_id, agent_id, guardian_id);
     this.owner_id = config.owner_id;
     this.agent_id = config.agent_id;
+    this.guardian_id = config.guardian_id;
   }
 
   @call({})
@@ -45,6 +49,24 @@ class PayGuard {
   get_pending_policy() { return getPendingPolicy(host); }
 
   @call({})
+  propose_owner_recovery({ owner_id }: { owner_id: string }): void { proposeOwnerRecovery(host, this, owner_id); }
+
+  @view({})
+  get_pending_owner_recovery() { return getPendingOwnerRecovery(host); }
+
+  @call({})
+  activate_owner_recovery({ proposal_id }: { proposal_id: string }): void { activateOwnerRecovery(host, this, proposal_id); }
+
+  @call({})
+  propose_guardian_change({ guardian_id }: { guardian_id: string }): void { proposeGuardianChange(host, this, guardian_id); }
+
+  @view({})
+  get_pending_guardian_change() { return getPendingGuardianChange(host); }
+
+  @call({})
+  activate_guardian_change({ proposal_id }: { proposal_id: string }): void { activateGuardianChange(host, this, proposal_id); }
+
+  @call({})
   pay(input: Payment): NearPromise {
     const payment = reserve(host, this, input);
     // Guard owns the FT balance; predecessor of ft_transfer is this contract.
@@ -55,8 +77,8 @@ class PayGuard {
   }
 
   @view({})
-  get_config(): { owner_id: string; agent_id: string } {
-    return { owner_id: this.owner_id, agent_id: this.agent_id };
+  get_config(): { owner_id: string; agent_id: string; guardian_id: string } {
+    return { owner_id: this.owner_id, agent_id: this.agent_id, guardian_id: this.guardian_id };
   }
 
   @view({})

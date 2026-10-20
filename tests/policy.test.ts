@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  proposeOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery, proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
   initialize, setPolicy, activatePolicy, getPendingPolicy, disablePolicy, cancelPolicy, POLICY_DELAY_NS, reserve, getSpending, getPolicy, dayAt, accountId,
   DAY_NS, U128_MAX, MIN_PAY_GAS, MAX_PAY_GAS, type Host, type Payment,
 } from "../contract/policy.ts";
@@ -16,7 +17,7 @@ function fixture() {
     attachedDeposit: () => deposit, prepaidGas: () => gas, timestamp: () => now,
     read: (key) => storage.get(key) ?? null, write: (key, value) => { storage.set(key, value); },
   };
-  const config = initialize(host, caller, "agent.test.near");
+  const config = initialize(host, caller, "agent.test.near", "guardian.test.near");
   const policy = {
     token_id: "usdc.test.near", max_per_payment: "50000000", daily_limit: "100000000",
     recipients: ["alice.test.near"],
@@ -149,10 +150,10 @@ test("zero deposit and bounded prepaid gas are mandatory", () => {
 
 test("trusted initialization requires distinct owner, agent, guard and authentic owner", () => {
   const f = fixture();
-  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id), /owner_only/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, "guardian.test.near"), /owner_only/);
   f.caller(f.config.owner_id);
-  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.owner_id), /separate_agent_required/);
-  assert.throws(() => initialize(f.host, f.config.owner_id, "guard.test.near"), /separate_agent_required/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.owner_id, "guardian.test.near"), /separate_agent_required/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, "guard.test.near", "guardian.test.near"), /separate_agent_required/);
 });
 
 test("policy validation is complete before write, and empty recipients pause payments", () => {
@@ -263,7 +264,7 @@ test("disable, re-enable, recipient additions and cancellations cannot bypass de
   const next = getPendingPolicy(f.host)!;
   f.caller(f.config.agent_id);
   assert.throws(() => f.tx(), /unknown_token/);
-  assert.throws(() => cancelPolicy(f.host, f.config), /owner_only/);
+  assert.throws(() => cancelPolicy(f.host, f.config), /owner_or_guardian_only/);
   assert.throws(() => disablePolicy(f.host, f.config, f.policy.token_id), /owner_only/);
   f.caller(f.config.owner_id); cancelPolicy(f.host, f.config);
   f.time(BigInt(next.activate_after));
@@ -342,4 +343,83 @@ test("cross-token tightening cancels pending enablement; re-proposal restarts th
   assert.deepEqual(getPolicy(f.host, target.token_id), {
     max_per_payment: target.max_per_payment, daily_limit: target.daily_limit, recipients: target.recipients,
   });
+});
+
+
+test("guardian veto leaves policy, spending and replay protection intact", () => {
+  const f = fixture(); f.tx({ ...f.payment, request_id: "kept" });
+  f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" });
+  const pending = getPendingPolicy(f.host)!;
+  f.caller("stranger.near");
+  assert.throws(() => cancelPolicy(f.host, f.config), /owner_or_guardian_only/);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "next.near"), /guardian_only/);
+  f.caller(f.config.guardian_id); cancelPolicy(f.host, f.config); f.reload();
+  f.time(BigInt(pending.activate_after));
+  assert.throws(() => activatePolicy(f.host, pending.proposal_id), /no_pending_policy/);
+  assert.equal(getPolicy(f.host, f.policy.token_id)!.max_per_payment, "50000000");
+  assert.throws(() => f.tx(), /agent_only/);
+  assert.throws(() => setPolicy(f.host, f.config, f.policy), /owner_only/);
+  f.caller(f.config.agent_id);
+  assert.throws(() => f.tx({ ...f.payment, amount: "60000000" }), /max_per_payment/);
+  assert.throws(() => f.tx({ ...f.payment, request_id: "kept" }), /duplicate_request/);
+  assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
+});
+
+test("recovery supersession restarts 24 hours; owner cannot bypass freeze or retain authority", () => {
+  const f = fixture(); f.tx({ ...f.payment, request_id: "before-recovery" });
+  const old = f.config.owner_id;
+  f.caller(f.config.guardian_id);
+  proposeGuardianChange(f.host, f.config, "guardian2.near");
+  proposeOwnerRecovery(f.host, f.config, "next.near");
+  assert.equal(getPendingGuardianChange(f.host), null);
+  const first = getPendingOwnerRecovery(f.host)!;
+  f.time(BigInt(first.activate_after) - 1n);
+  assert.throws(() => activateOwnerRecovery(f.host, f.config, first.proposal_id), /identity_timelocked/);
+  proposeOwnerRecovery(f.host, f.config, "final.near");
+  const second = getPendingOwnerRecovery(f.host)!; f.reload();
+  assert.ok(BigInt(second.activate_after) > BigInt(first.activate_after));
+  assert.throws(() => activateOwnerRecovery(f.host, f.config, first.proposal_id), /proposal_id_mismatch/);
+  assert.throws(() => proposeGuardianChange(f.host, f.config, "guardian2.near"), /recovery_pending/);
+  f.caller(old);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "attacker.near"), /guardian_only/);
+  cancelPolicy(f.host, f.config);
+  assert.throws(() => setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
+  assert.throws(() => activatePolicy(f.host, "1"), /recovery_pending/);
+  f.caller("final.near");
+  assert.throws(() => setPolicy(f.host, f.config, f.policy), /owner_only/);
+  f.time(BigInt(second.activate_after) - 1n);
+  assert.throws(() => activateOwnerRecovery(f.host, f.config, second.proposal_id), /identity_timelocked/);
+  f.time(BigInt(second.activate_after)); activateOwnerRecovery(f.host, f.config, second.proposal_id);
+  assert.equal(f.config.owner_id, "final.near");
+  setPolicy(f.host, f.config, f.policy);
+  f.caller(old); assert.throws(() => setPolicy(f.host, f.config, f.policy), /owner_only/);
+  assert.throws(() => activateOwnerRecovery(f.host, f.config, second.proposal_id), /no_pending_identity/);
+  f.caller(f.config.agent_id);
+  assert.throws(() => f.tx({ ...f.payment, request_id: "before-recovery" }), /duplicate_request/);
+  assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
+});
+
+test("guardian changes require current guardian and a full delay; identities remain separate", () => {
+  const f = fixture();
+  f.caller(f.config.owner_id);
+  for (const id of [f.config.owner_id, f.config.agent_id, "guard.test.near"]) {
+    assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, id), /separate_guardian_required/);
+  }
+  assert.throws(() => proposeGuardianChange(f.host, f.config, "next.near"), /guardian_only/);
+  f.caller(f.config.guardian_id);
+  for (const id of [f.config.owner_id, f.config.agent_id, f.config.guardian_id, "guard.test.near"]) {
+    assert.throws(() => proposeOwnerRecovery(f.host, f.config, id), /separate_replacement_required/);
+    assert.throws(() => proposeGuardianChange(f.host, f.config, id), /separate_replacement_required/);
+  }
+  f.deposit(1n);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "next.near"), /zero_deposit_required/);
+  f.deposit(0n);
+  proposeGuardianChange(f.host, f.config, "next.near");
+  const p = getPendingGuardianChange(f.host)!;
+  f.time(BigInt(p.activate_after) - 1n);
+  assert.throws(() => activateGuardianChange(f.host, f.config, p.proposal_id), /identity_timelocked/);
+  f.time(BigInt(p.activate_after)); activateGuardianChange(f.host, f.config, p.proposal_id);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "newowner.near"), /guardian_only/);
+  f.caller("next.near"); proposeOwnerRecovery(f.host, f.config, "newowner.near");
 });

@@ -47,21 +47,23 @@ export type Host = {
   read(key: string): string | null;
   write(key: string, value: string): void;
 };
-export type Config = { owner_id: string; agent_id: string };
+export type Config = { owner_id: string; agent_id: string; guardian_id: string };
 export type Payment = { request_id: string; token_id: string; recipient_id: string; amount: string };
 
 function zeroDeposit(host: Host): void {
   requireThat(host.attachedDeposit() === 0n, "zero_deposit_required");
 }
 
-export function initialize(host: Host, owner: unknown, agent: unknown): Config {
+export function initialize(host: Host, owner: unknown, agent: unknown, guardian: unknown): Config {
   zeroDeposit(host);
   const owner_id = accountId(owner);
   const agent_id = accountId(agent);
   requireThat(host.predecessor() === owner_id, "owner_only");
   requireThat(agent_id !== owner_id && agent_id !== host.currentAccount(), "separate_agent_required");
   requireThat(owner_id !== host.currentAccount(), "separate_owner_required");
-  return { owner_id, agent_id };
+  const guardian_id = accountId(guardian);
+  requireThat(![owner_id, agent_id, host.currentAccount()].includes(guardian_id), "separate_guardian_required");
+  return { owner_id, agent_id, guardian_id };
 }
 
 export function setPolicy(host: Host, config: Config, input: {
@@ -86,6 +88,7 @@ export function setPolicy(host: Host, config: Config, input: {
     host.write("policy:" + token, JSON.stringify(target));
     return;
   }
+  requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
   requireThat(getPendingPolicy(host) === null, "pending_policy_exists");
   // Apply the intersection now: mixed changes cannot postpone tightening.
   if (old !== null) {
@@ -112,7 +115,7 @@ export function getPendingPolicy(host: Host): PendingPolicy | null {
 
 export function cancelPolicy(host: Host, config: Config): void {
   zeroDeposit(host);
-  requireThat(host.predecessor() === config.owner_id, "owner_only");
+  requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
   host.write("pending_policy", "null");
 }
 
@@ -126,6 +129,7 @@ export function disablePolicy(host: Host, config: Config, token: unknown): void 
 
 export function activatePolicy(host: Host, proposalId: unknown): void {
   zeroDeposit(host);
+  requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
   const pending = getPendingPolicy(host);
   requireThat(pending !== null, "no_pending_policy");
   requireThat(proposalId === pending.proposal_id, "proposal_id_mismatch");
@@ -171,4 +175,54 @@ export function reserve(host: Host, config: Config, input: Payment): Payment {
   // downstream transfer failure, across policy changes and UTC-day rollover.
   host.write(requestKey, "reserved");
   return { request_id: input.request_id, token_id, recipient_id, amount: units.toString() };
+}
+
+// Identity changes never schedule promises or touch payment accounting.
+export const RECOVERY_DELAY_NS = DAY_NS;
+export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string };
+export function getPendingOwnerRecovery(host: Host): PendingIdentity | null {
+  return JSON.parse(host.read("pending_owner_recovery") ?? "null");
+}
+export function getPendingGuardianChange(host: Host): PendingIdentity | null {
+  return JSON.parse(host.read("pending_guardian_change") ?? "null");
+}
+function proposeIdentity(host: Host, config: Config, replacement: unknown, recovery: boolean): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+  const account_id = accountId(replacement);
+  requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
+  if (!recovery) requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
+  const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
+  host.write("identity_sequence", proposal_id);
+  host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", JSON.stringify({
+    proposal_id, account_id, activate_after: (host.timestamp() + RECOVERY_DELAY_NS).toString(),
+  }));
+  if (recovery) {
+    host.write("pending_policy", "null");
+    host.write("pending_guardian_change", "null");
+  }
+}
+export function proposeOwnerRecovery(host: Host, config: Config, replacement: unknown): void {
+  proposeIdentity(host, config, replacement, true);
+}
+export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
+  proposeIdentity(host, config, replacement, false);
+}
+function activateIdentity(host: Host, config: Config, proposalId: unknown, recovery: boolean): void {
+  zeroDeposit(host);
+  if (!recovery) requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
+  const pending = recovery ? getPendingOwnerRecovery(host) : getPendingGuardianChange(host);
+  requireThat(pending !== null, "no_pending_identity");
+  requireThat(pending.proposal_id === proposalId, "proposal_id_mismatch");
+  requireThat(host.timestamp() >= BigInt(pending.activate_after), "identity_timelocked");
+  requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
+  if (recovery) config.owner_id = pending.account_id;
+  else config.guardian_id = pending.account_id;
+  host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", "null");
+}
+export function activateOwnerRecovery(host: Host, config: Config, proposalId: unknown): void {
+  activateIdentity(host, config, proposalId, true);
+}
+export function activateGuardianChange(host: Host, config: Config, proposalId: unknown): void {
+  activateIdentity(host, config, proposalId, false);
 }

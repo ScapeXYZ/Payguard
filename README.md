@@ -47,8 +47,8 @@ are also covered by the fast deterministic tests.
 
 ## Contract API and accounting
 
-- `init({owner_id, agent_id})`: once only; predecessor must equal owner. Owner,
-  agent, and guard must be separate accounts. Create/deploy/initialize together
+- `init({owner_id, agent_id, guardian_id})`: once only; predecessor must equal owner. Owner,
+  agent, guardian, and guard must be separate accounts. Create/deploy/initialize together
   as described below to prevent an initialization takeover.
 - `set_policy({token_id, max_per_payment, daily_limit, recipients})`: owner-only,
   zero deposit. Submits a full token policy under the timelock lifecycle below.
@@ -58,7 +58,7 @@ are also covered by the fast deterministic tests.
   Changes govern new authorizations; they cannot cancel previously scheduled transfers.
 - `disable_policy({token_id})`: owner-only, zero deposit; immediately disables the
   token and cancels any pending proposal, preserving all spending.
-- `cancel_policy()`: owner-only, zero deposit; clears the pending proposal.
+- `cancel_policy()`: owner-or-guardian, zero deposit; clears the pending proposal.
 - `activate_policy({proposal_id})`: permissionless, zero deposit; activates only
   the exact current proposal after its on-chain deadline, then clears it.
 - `get_pending_policy()`: view returning `null` or
@@ -78,7 +78,7 @@ Both initial token enablement and re-enablement require this delay. Submit
 `set_policy`, inspect `get_pending_policy`, wait until `activate_after`, then
 call `activate_policy` with that proposal's ID. Expiry alone does not activate it.
 Any account may activate; it cannot supply a replacement policy or deadline.
-Owner and agent identities remain immutable; there is no agent-change method.
+The agent identity remains immutable; owner recovery and guardian succession follow the lifecycle below.
 
 A full replacement is immediate only if both limits are no higher and every
 recipient was already approved. Duplicates/casing are normalized before comparison.
@@ -160,11 +160,11 @@ handles a missing/failed callback because no callback exists.
 These are setup instructions, not actions performed by the test suite. Use only
 testnet accounts and valueless test tokens; no mainnet deployment is included.
 
-1. Create separate owner and agent accounts. Keep setup full-access credentials
+1. Create separate owner, agent and independently controlled guardian accounts. Keep setup full-access credentials
    with the trusted operator until their on-chain retirement. In **one transaction action batch signed by owner**,
    receiver a new child guard account: create account, fund storage,
    add a temporary operator-only full-access key, deploy `build/guard.wasm`, and call `init`
-   with `{owner_id, agent_id}` and zero deposit. The Sandbox fixture demonstrates
+   with `{owner_id, agent_id, guardian_id}` and zero deposit. The Sandbox fixture demonstrates
    this sequence. Do not deploy uninitialized code publicly: an attacker could
    claim it by naming themselves owner. A separate owner cannot deploy arbitrary
    code onto an existing account; the creation batch establishes this authority.
@@ -210,8 +210,8 @@ and [asynchronous cross-contract calls](https://docs.near.org/smart-contracts/an
 
 An owner compromise can immediately pause/restrict payments or cancel proposals
 (denial of service). It can loosen policy only after the 24-hour delay; monitoring
-and an owner-authorized cancellation/tightening response are required during that
-window. There is no independent guardian, owner rotation, or automatic veto. An
+and an owner or guardian cancellation response are required during that
+window. A separately configured guardian can veto proposals and initiate delayed owner recovery; there is no automatic veto. An
 attacker retaining owner authority can re-propose and eventually activate malicious
 changes, including malicious tokens/recipients. The delay does not protect funds
 after that deadline, recover a compromised key, or stop payments already allowed
@@ -246,3 +246,57 @@ Recheck with `npm audit`; it currently exits nonzero for the remaining findings.
 
 See [the focused security review](docs/security-review.md) for severity-ranked
 findings, all twelve high-severity dependency entries and their reachability.
+
+
+## Guardian and owner recovery lifecycle
+
+New deployments require `guardian_id` in `init` and return it in `get_config`.
+Owner, agent, guardian and guard must all be distinct. Configuration is persistent
+SDK-managed on-chain state; authorization always uses NEAR predecessor, never
+signer or a supplied identity. This initialization API is incompatible with older
+clients. Existing locked deployments cannot upgrade to this code.
+
+`cancel_policy()` accepts the current owner or guardian, immediately invalidates
+pending loosening and leaves active policy, daily spending and request markers
+untouched. Previously applied mixed-change tightening remains active.
+
+Guardian-only `propose_owner_recovery({owner_id})` stores a unique proposal ID,
+replacement account and `activate_after` in nanoseconds. Inspect with
+`get_pending_owner_recovery()`. Creation clears pending policy and guardian change.
+Recovery freezes all policy loosening, including enablement, and policy activation;
+owner tightening, disabling and cancellation remain available. Existing bounded
+agent payments continue. There is no recovery cancellation method, including for
+the owner. Guardian corrections require a new proposal and a fresh full delay.
+Permissionless `activate_owner_recovery({proposal_id})` requires the current ID
+and trusted block timestamp at least 24 hours after proposal. Only then does the
+new owner acquire policy administration and the old owner lose it. The new owner
+still waits the ordinary policy timelock for loosening.
+
+Guardian-only `propose_guardian_change({guardian_id})`,
+`get_pending_guardian_change()` and permissionless
+`activate_guardian_change({proposal_id})` provide guardian succession with the
+same fixed 24-hour delay and unique IDs. Only the existing guardian can authorize
+its replacement; the owner cannot remove it. Supersession restarts the delay.
+Guardian changes are blocked during recovery and canceled when recovery starts.
+Replacement identities must differ from current owner, guardian, agent and guard.
+All mutation calls require zero deposit. No delay parameter or supplied clock is
+accepted. Stale IDs reject; successful activation clears its proposal.
+
+Use a separately controlled guardian account, preferably with independent custody
+and monitoring. Account separation cannot prove separate key custody. A compromised
+guardian can veto indefinitely, freeze loosening and replace the owner after 24
+hours, eventually enabling malicious policy after its additional policy delay.
+It has no direct payment, transfer, key-installation or policy-setting authority.
+An owner cannot stop a malicious guardian recovery. Delayed guardian succession is
+not protection against persistent compromise of the current guardian. Loss of the
+guardian prevents recovery and guardian replacement; no owner override exists.
+Account syntax validation does not prove replacement existence or usable authority;
+verify custody and account availability before proposing. Monitor both pending
+identity views and policy proposals; delays do not automatically trigger alerts.
+
+Recovery preserves the zero-key guard architecture, immutable payment agent,
+policy limits, UTC spending history and lifetime request markers. It cannot cancel
+already scheduled transfers, repair token code, upgrade WASM, recover arbitrary
+assets, restore guard access keys or replenish the restricted agent's allowance.
+The old owner can still cause denial of service by tightening/disabling during
+the recovery window. Ordinary allowed payments remain exposed during that window.
