@@ -1,3 +1,4 @@
+// Reference/compatibility only. contract/guard.ts enforces authoritative on-chain policy.
 // payguard: checks every agent payment before it goes out.
 // Returns allow or block, always with a reason.
 
