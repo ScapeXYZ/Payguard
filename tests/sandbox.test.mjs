@@ -88,6 +88,7 @@ async function fixture(t) {
     recipient_id: alice.accountId, amount: "1",
   }, { gas: 80_000_000_000_000n, attachedDeposit: 1n }), /not payable/i);
   await assert.rejects(agent.call(guard, "set_policy", policy), /owner_only/);
+  await assert.rejects(agent.call(guard, "cancel_owner_recovery", {}), /owner_only/);
   const agentSetupKey = await agent.getKey();
   const retired = await agent.batch(agent).deleteKey(agentSetupKey.getPublicKey()).transact();
   assert.equal(retired.failed, false);
@@ -269,7 +270,35 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   await assert.rejects(f.pay({ ...f.payment, amount: "60000000" }), /max_per_payment/);
   await assert.rejects(f.guardian.call(f.guard, "pay", { ...f.payment, request_id: "guardian-pay" }, { gas: f.options.gas }), /agent_only/);
   await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const canceled = await f.guard.view("get_pending_owner_recovery");
+  const config = await f.guard.view("get_config");
+  const activePolicy = await f.guard.view("get_policy", { token_id: f.token.accountId });
+  for (const caller of [f.guardian, f.stranger]) {
+    await assert.rejects(caller.call(f.guard, "cancel_owner_recovery", {}), /owner_only/);
+  }
+  await assert.rejects(f.agent.call(f.guard, "cancel_owner_recovery", {}, f.options), { type: "MethodNameMismatch" });
+  await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
+  await f.owner.call(f.guard, "cancel_owner_recovery", {});
+  assert.equal(await f.guard.view("get_pending_owner_recovery"), null);
+  assert.deepEqual(await f.guard.view("get_config"), config);
+  assert.deepEqual(await f.guard.view("get_policy", { token_id: f.token.accountId }), activePolicy);
+  assert.equal((await f.spending({ day: spent.day })).spent, spent.spent);
+  await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: canceled.proposal_id }), /no_pending_identity/);
+  await f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" });
+  assert.ok(await f.guard.view("get_pending_policy"));
+  for (let jumps = 0; jumps < 40; jumps++) {
+    const block = await f.worker.provider.block({ finality: "final" });
+    if (BigInt(block.header.timestamp_nanosec) >= BigInt(canceled.activate_after)) break;
+    await f.worker.provider.fastForward(1_000_000);
+  }
+  assert.ok(BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(canceled.activate_after));
+  await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: canceled.proposal_id }), /no_pending_identity/);
+  const beforeProposal = await f.worker.provider.block({ finality: "final" });
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
   const pending = await f.guard.view("get_pending_owner_recovery");
+  assert.ok(BigInt(pending.proposal_id) > BigInt(canceled.proposal_id));
+  assert.ok(BigInt(pending.activate_after) >= BigInt(beforeProposal.header.timestamp_nanosec) + 86_400_000_000_000n);
+  assert.ok(BigInt(pending.activate_after) > BigInt(canceled.activate_after));
   await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: pending.proposal_id }), /identity_timelocked/);
   await assert.rejects(f.stranger.call(f.guard, "set_policy", f.policy), /owner_only/);
   await f.owner.call(f.guard, "cancel_policy", {});

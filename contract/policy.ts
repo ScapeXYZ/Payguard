@@ -205,6 +205,13 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
 export function proposeOwnerRecovery(host: Host, config: Config, replacement: unknown): void {
   proposeIdentity(host, config, replacement, true);
 }
+// The current owner can veto immediately, including after the recovery deadline.
+// Preserve the identity sequence so a canceled proposal can never be reused.
+export function cancelOwnerRecovery(host: Host, config: Config): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.owner_id, "owner_only");
+  host.write("pending_owner_recovery", "null");
+}
 export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
   proposeIdentity(host, config, replacement, false);
 }
