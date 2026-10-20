@@ -3,7 +3,7 @@ import {
   initialize as initializeConfig, setPolicy, reserve, getPolicy, getSpending, dayAt, TRANSFER_GAS,
   activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
   getRecoveryCooldown, proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
-  proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
+  proposeGuardianChange, cancelGuardianChange, activateGuardianChange, getPendingGuardianChange,
   type Host, type Payment,
 } from "./policy";
 
@@ -65,6 +65,9 @@ class PayGuard {
 
   @call({})
   propose_guardian_change({ guardian_id }: { guardian_id: string }): void { proposeGuardianChange(host, this, guardian_id); }
+
+  @call({})
+  cancel_guardian_change(): void { cancelGuardianChange(host, this); }
 
   @view({})
   get_pending_guardian_change() { return getPendingGuardianChange(host); }
