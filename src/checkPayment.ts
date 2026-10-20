@@ -15,7 +15,7 @@ export type Policy = {
 
 export type Decision =
   | { allow: true; reason: string }
-  | { allow: false; reason: string; rule: "max_per_payment" | "daily_limit" | "unknown_address" | "bad_input" };
+  | { allow: false; reason: string; rule: "max_per_payment" | "daily_limit" | "unknown_address" | "unknown_token" | "bad_input" };
 
 // spentToday: token -> amount already sent today (caller keeps this state for now)
 export function checkPayment(
@@ -32,15 +32,27 @@ export function checkPayment(
     return { allow: false, rule: "unknown_address", reason: `recipient ${p.to} is not on the known address list` };
   }
 
+  const token = p.token.toUpperCase();
+  const matchingAmounts = (amounts: Record<string, number>) =>
+    Object.entries(amounts)
+      .filter(([key]) => key.toUpperCase() === token)
+      .map(([, amount]) => amount);
+  // If multiple case variants are configured, retain the strictest cap.
+  const maxima = matchingAmounts(policy.maxPerPayment);
+  const limits = matchingAmounts(policy.dailyLimit);
+  const max = maxima.length ? Math.min(...maxima) : undefined;
+  const limit = limits.length ? Math.min(...limits) : undefined;
+  if (max === undefined && limit === undefined) {
+    return { allow: false, rule: "unknown_token", reason: `token ${p.token} has no configured per-payment cap or daily limit` };
+  }
+
   // rule 2: max per payment
-  const max = policy.maxPerPayment[p.token];
   if (max !== undefined && p.amount > max) {
     return { allow: false, rule: "max_per_payment", reason: `${p.amount} ${p.token} is above the ${max} ${p.token} per-payment cap` };
   }
 
   // rule 3: daily limit
-  const limit = policy.dailyLimit[p.token];
-  const spent = spentToday[p.token] ?? 0;
+  const spent = matchingAmounts(spentToday).reduce((total, amount) => total + amount, 0);
   if (limit !== undefined && spent + p.amount > limit) {
     return { allow: false, rule: "daily_limit", reason: `would bring today's ${p.token} total to ${spent + p.amount}, limit is ${limit}` };
   }
