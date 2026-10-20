@@ -1,0 +1,11 @@
+{
+  "name": "payguard",
+  "version": "0.1.0",
+  "description": "Payment guard for AI agents on NEAR: checks every payment before it goes out and blocks bad ones, with a reason.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/*.test.ts"
+  },
+  "engines": { "node": ">=22.6" }
+}
