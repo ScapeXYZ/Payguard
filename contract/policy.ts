@@ -179,7 +179,11 @@ export function reserve(host: Host, config: Config, input: Payment): Payment {
 
 // Identity changes never schedule promises or touch payment accounting.
 export const RECOVERY_DELAY_NS = DAY_NS;
-export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string };
+export const RECOVERY_COOLDOWN_NS = DAY_NS; // Fixed 24 hours after an owner veto.
+export function getRecoveryCooldown(host: Host): string {
+  return host.read("recovery_cooldown_until") ?? "0";
+}
+export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string; owner_proposed?: boolean };
 export function getPendingOwnerRecovery(host: Host): PendingIdentity | null {
   return JSON.parse(host.read("pending_owner_recovery") ?? "null");
 }
@@ -188,18 +192,27 @@ export function getPendingGuardianChange(host: Host): PendingIdentity | null {
 }
 function proposeIdentity(host: Host, config: Config, replacement: unknown, recovery: boolean): void {
   zeroDeposit(host);
-  requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+  if (recovery) {
+    requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+    requireThat(host.timestamp() >= BigInt(getRecoveryCooldown(host)), "recovery_cooldown");
+  } else {
+    requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
+    if (host.predecessor() !== config.owner_id) {
+      requireThat(!getPendingGuardianChange(host)?.owner_proposed, "owner_guardian_change_pending");
+      requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
+    }
+  }
   const account_id = accountId(replacement);
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
-  if (!recovery) requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
   const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
   host.write("identity_sequence", proposal_id);
   host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", JSON.stringify({
     proposal_id, account_id, activate_after: (host.timestamp() + RECOVERY_DELAY_NS).toString(),
+    ...(!recovery ? { owner_proposed: host.predecessor() === config.owner_id } : {}),
   }));
   if (recovery) {
     host.write("pending_policy", "null");
-    host.write("pending_guardian_change", "null");
+    if (!getPendingGuardianChange(host)?.owner_proposed) host.write("pending_guardian_change", "null");
   }
 }
 export function proposeOwnerRecovery(host: Host, config: Config, replacement: unknown): void {
@@ -210,21 +223,30 @@ export function proposeOwnerRecovery(host: Host, config: Config, replacement: un
 export function cancelOwnerRecovery(host: Host, config: Config): void {
   zeroDeposit(host);
   requireThat(host.predecessor() === config.owner_id, "owner_only");
-  host.write("pending_owner_recovery", "null");
+  if (getPendingOwnerRecovery(host) !== null) {
+    host.write("recovery_cooldown_until", (host.timestamp() + RECOVERY_COOLDOWN_NS).toString());
+    host.write("pending_owner_recovery", "null");
+  }
 }
 export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
   proposeIdentity(host, config, replacement, false);
 }
 function activateIdentity(host: Host, config: Config, proposalId: unknown, recovery: boolean): void {
   zeroDeposit(host);
-  if (!recovery) requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
   const pending = recovery ? getPendingOwnerRecovery(host) : getPendingGuardianChange(host);
   requireThat(pending !== null, "no_pending_identity");
   requireThat(pending.proposal_id === proposalId, "proposal_id_mismatch");
   requireThat(host.timestamp() >= BigInt(pending.activate_after), "identity_timelocked");
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
-  if (recovery) config.owner_id = pending.account_id;
-  else config.guardian_id = pending.account_id;
+  if (recovery) {
+    config.owner_id = pending.account_id;
+    // The former owner's pending administration cannot survive ownership recovery.
+    host.write("pending_guardian_change", "null");
+  } else {
+    config.guardian_id = pending.account_id;
+    // Displaced guardian authority must not survive in a queued recovery.
+    host.write("pending_owner_recovery", "null");
+  }
   host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", "null");
 }
 export function activateOwnerRecovery(host: Host, config: Config, proposalId: unknown): void {

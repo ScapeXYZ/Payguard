@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery, proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
+  getRecoveryCooldown, RECOVERY_COOLDOWN_NS, proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery, proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
   initialize, setPolicy, activatePolicy, getPendingPolicy, disablePolicy, cancelPolicy, POLICY_DELAY_NS, reserve, getSpending, getPolicy, dayAt, accountId,
   DAY_NS, U128_MAX, MIN_PAY_GAS, MAX_PAY_GAS, type Host, type Payment,
 } from "../contract/policy.ts";
@@ -400,13 +400,14 @@ test("recovery supersession restarts 24 hours; without veto owner loses authorit
   assert.equal(getSpending(f.host, f.policy.token_id, "20000"), "40000000");
 });
 
-test("guardian changes require current guardian and a full delay; identities remain separate", () => {
+test("guardian changes accept owner or current guardian and a full delay; identities remain separate", () => {
   const f = fixture();
   f.caller(f.config.owner_id);
   for (const id of [f.config.owner_id, f.config.agent_id, "guard.test.near"]) {
     assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, id), /separate_guardian_required/);
   }
-  assert.throws(() => proposeGuardianChange(f.host, f.config, "next.near"), /guardian_only/);
+  f.caller("stranger.near");
+  assert.throws(() => proposeGuardianChange(f.host, f.config, "next.near"), /owner_or_guardian_only/);
   f.caller(f.config.guardian_id);
   for (const id of [f.config.owner_id, f.config.agent_id, f.config.guardian_id, "guard.test.near"]) {
     assert.throws(() => proposeOwnerRecovery(f.host, f.config, id), /separate_replacement_required/);
@@ -457,10 +458,12 @@ test("owner veto clears only recovery, releases freeze and gives fresh recovery 
   f.caller(f.config.agent_id);
   assert.throws(() => f.tx({ ...f.payment, request_id: "veto-kept" }), /duplicate_request/);
   f.caller(f.config.guardian_id);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "next.near"), /recovery_cooldown/);
+  f.time(BigInt(getRecoveryCooldown(f.host)));
   proposeOwnerRecovery(f.host, f.config, "next.near");
   const fresh = getPendingOwnerRecovery(f.host)!;
   assert.ok(BigInt(fresh.proposal_id) > BigInt(first.proposal_id));
-  assert.equal(BigInt(fresh.activate_after), BigInt(first.activate_after) + 1n + DAY_NS);
+  assert.equal(BigInt(fresh.activate_after), BigInt(getRecoveryCooldown(f.host)) + DAY_NS);
   assert.equal(getPendingPolicy(f.host), null);
   assert.throws(() => activateOwnerRecovery(f.host, f.config, first.proposal_id), /proposal_id_mismatch/);
   f.time(BigInt(fresh.activate_after) - 1n);
@@ -480,4 +483,68 @@ test("owner veto remains immediate after a recovery matures", () => {
   f.time(BigInt(pending.activate_after)); f.caller(f.config.owner_id);
   cancelOwnerRecovery(f.host, f.config);
   assert.throws(() => activateOwnerRecovery(f.host, f.config, pending.proposal_id), /no_pending_identity/);
+});
+
+test("owner replacement survives recovery and guardian interference; activation revokes queued authority", () => {
+  const f = fixture(); const old = f.config.guardian_id;
+  f.caller(old); proposeOwnerRecovery(f.host, f.config, "thief.near");
+  const recovery = getPendingOwnerRecovery(f.host)!;
+  f.caller(f.config.owner_id); proposeGuardianChange(f.host, f.config, "safe.near");
+  const first = getPendingGuardianChange(f.host)!;
+  f.time(BigInt(first.activate_after) - 1n);
+  proposeGuardianChange(f.host, f.config, "safe.near");
+  const pending = getPendingGuardianChange(f.host)!;
+  assert.equal(BigInt(pending.activate_after), BigInt(first.activate_after) - 1n + DAY_NS);
+  assert.throws(() => activateGuardianChange(f.host, f.config, first.proposal_id), /proposal_id_mismatch/);
+  f.caller(old);
+  assert.throws(() => proposeGuardianChange(f.host, f.config, "evil.near"), /owner_guardian_change_pending/);
+  proposeOwnerRecovery(f.host, f.config, "thief.near");
+  const newer = getPendingOwnerRecovery(f.host)!;
+  assert.deepEqual(getPendingGuardianChange(f.host), pending);
+  f.time(BigInt(pending.activate_after) - 1n);
+  assert.throws(() => activateGuardianChange(f.host, f.config, pending.proposal_id), /identity_timelocked/);
+  f.reload(); f.time(BigInt(pending.activate_after));
+  activateGuardianChange(f.host, f.config, pending.proposal_id);
+  assert.equal(getPendingOwnerRecovery(f.host), null);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "thief.near"), /guardian_only/);
+  assert.throws(() => cancelPolicy(f.host, f.config), /owner_or_guardian_only/);
+  for (const p of [recovery, newer]) assert.throws(() => activateOwnerRecovery(f.host, f.config, p.proposal_id), /no_pending_identity/);
+  f.caller("safe.near"); cancelPolicy(f.host, f.config);
+  proposeOwnerRecovery(f.host, f.config, "legitimate.near");
+});
+
+test("veto cooldown persists to exact boundary, no-op cancellation cannot extend it, safe administration works", () => {
+  const f = fixture(); f.caller(f.config.guardian_id);
+  proposeOwnerRecovery(f.host, f.config, "next.near");
+  f.caller(f.config.owner_id); cancelOwnerRecovery(f.host, f.config);
+  const until = BigInt(getRecoveryCooldown(f.host));
+  assert.equal(until, f.host.timestamp() + RECOVERY_COOLDOWN_NS);
+  f.reload(); f.time(until - 1n); cancelOwnerRecovery(f.host, f.config);
+  assert.equal(BigInt(getRecoveryCooldown(f.host)), until);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "1" });
+  proposeGuardianChange(f.host, f.config, "safe.near");
+  f.caller(f.config.guardian_id);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, "next.near"), /^Error: recovery_cooldown$/);
+  f.time(until); proposeOwnerRecovery(f.host, f.config, "next.near");
+  const p = getPendingOwnerRecovery(f.host)!;
+  assert.equal(BigInt(p.activate_after), until + DAY_NS);
+  f.time(until + DAY_NS - 1n);
+  assert.throws(() => activateOwnerRecovery(f.host, f.config, p.proposal_id), /identity_timelocked/);
+  f.time(until + DAY_NS); activateOwnerRecovery(f.host, f.config, p.proposal_id);
+  assert.equal(getPendingGuardianChange(f.host), null);
+  assert.equal(f.config.owner_id, "next.near");
+
+  // A replacement queued earlier can mature strictly inside the veto cooldown.
+  const g = fixture(); g.caller(g.config.owner_id);
+  proposeGuardianChange(g.host, g.config, "safe.near");
+  const change = getPendingGuardianChange(g.host)!;
+  g.time(BigInt(change.activate_after) - 1n); g.caller(g.config.guardian_id);
+  proposeOwnerRecovery(g.host, g.config, "thief.near");
+  g.caller(g.config.owner_id); cancelOwnerRecovery(g.host, g.config);
+  g.time(BigInt(change.activate_after));
+  assert.ok(g.host.timestamp() < BigInt(getRecoveryCooldown(g.host)));
+  activateGuardianChange(g.host, g.config, change.proposal_id);
+  assert.equal(g.config.guardian_id, "safe.near");
+  g.caller("safe.near");
+  assert.throws(() => proposeOwnerRecovery(g.host, g.config, "next.near"), /recovery_cooldown/);
 });
