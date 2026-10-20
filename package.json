@@ -5,7 +5,27 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node --experimental-strip-types --test src/*.test.ts"
+    "test": "npm run test:reference && npm run test:contract",
+    "test:reference": "node --experimental-strip-types src/checkPayment.test.ts",
+    "test:contract": "node --experimental-strip-types tests/policy.test.ts",
+    "check": "tsc --noEmit",
+    "build": "near-sdk-js build contract/guard.ts build/guard.wasm && node scripts/check-exports.mjs",
+    "build:fixture": "near-sdk-js build tests/mock-ft.ts build/mock-ft.wasm",
+    "test:sandbox": "npm run build && npm run build:fixture && node --test --test-concurrency=1 tests/sandbox.test.mjs",
+    "test:all": "npm test && npm run check && npm run test:sandbox",
+    "setup:tools": "node scripts/setup-tools.mjs"
   },
-  "engines": { "node": ">=22.6" }
+  "engines": {
+    "node": ">=22.6"
+  },
+  "overrides": {
+    "tar": "7.5.22"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "near-api-js": "5.1.1",
+    "near-sdk-js": "2.0.0",
+    "near-workspaces": "5.0.0",
+    "typescript": "5.7.3"
+  }
 }

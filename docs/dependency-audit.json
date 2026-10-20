@@ -1,0 +1,563 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "@near-js/accounts": {
+      "name": "@near-js/accounts",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto",
+        "@near-js/providers",
+        "@near-js/signers",
+        "@near-js/transactions"
+      ],
+      "effects": [],
+      "range": ">=1.2.2",
+      "nodes": [
+        "node_modules/@near-js/accounts"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/crypto": {
+      "name": "@near-js/crypto",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "secp256k1"
+      ],
+      "effects": [
+        "@near-js/accounts",
+        "@near-js/keystores",
+        "@near-js/keystores-browser",
+        "@near-js/keystores-node",
+        "@near-js/signers",
+        "@near-js/transactions",
+        "@near-js/wallet-account",
+        "near-api-js"
+      ],
+      "range": ">=1.3.0-next.0",
+      "nodes": [
+        "node_modules/@near-js/crypto"
+      ],
+      "fixAvailable": {
+        "name": "near-api-js",
+        "version": "7.3.1",
+        "isSemVerMajor": true
+      }
+    },
+    "@near-js/keystores": {
+      "name": "@near-js/keystores",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto"
+      ],
+      "effects": [],
+      "range": ">=0.1.0-next.0",
+      "nodes": [
+        "node_modules/@near-js/keystores"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/keystores-browser": {
+      "name": "@near-js/keystores-browser",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto",
+        "@near-js/keystores"
+      ],
+      "effects": [],
+      "range": ">=0.1.0-next.0",
+      "nodes": [
+        "node_modules/@near-js/keystores-browser"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/keystores-node": {
+      "name": "@near-js/keystores-node",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto",
+        "@near-js/keystores"
+      ],
+      "effects": [],
+      "range": ">=0.0.13",
+      "nodes": [
+        "node_modules/@near-js/keystores-node"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/providers": {
+      "name": "@near-js/providers",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/transactions"
+      ],
+      "effects": [],
+      "range": ">=0.2.3",
+      "nodes": [
+        "node_modules/@near-js/providers"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/signers": {
+      "name": "@near-js/signers",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto",
+        "@near-js/keystores"
+      ],
+      "effects": [
+        "@near-js/transactions"
+      ],
+      "range": ">=0.1.5",
+      "nodes": [
+        "node_modules/@near-js/signers"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/transactions": {
+      "name": "@near-js/transactions",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/crypto",
+        "@near-js/signers"
+      ],
+      "effects": [
+        "@near-js/providers"
+      ],
+      "range": ">=1.2.3",
+      "nodes": [
+        "node_modules/@near-js/transactions"
+      ],
+      "fixAvailable": true
+    },
+    "@near-js/wallet-account": {
+      "name": "@near-js/wallet-account",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@near-js/accounts",
+        "@near-js/crypto",
+        "@near-js/keystores",
+        "@near-js/providers",
+        "@near-js/signers",
+        "@near-js/transactions"
+      ],
+      "effects": [
+        "near-api-js"
+      ],
+      "range": ">=1.2.3",
+      "nodes": [
+        "node_modules/@near-js/wallet-account"
+      ],
+      "fixAvailable": {
+        "name": "near-api-js",
+        "version": "7.3.1",
+        "isSemVerMajor": true
+      }
+    },
+    "@ts-morph/common": {
+      "name": "@ts-morph/common",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "fast-glob"
+      ],
+      "effects": [
+        "ts-morph"
+      ],
+      "range": "0.2.0 - 0.24.0 || 0.26.0 - 0.27.0",
+      "nodes": [
+        "node_modules/@ts-morph/common"
+      ],
+      "fixAvailable": false
+    },
+    "@typescript-eslint/eslint-plugin": {
+      "name": "@typescript-eslint/eslint-plugin",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@typescript-eslint/parser",
+        "@typescript-eslint/type-utils",
+        "@typescript-eslint/utils"
+      ],
+      "effects": [],
+      "range": "4.0.1-alpha.0 - 8.2.1-alpha.25",
+      "nodes": [
+        "node_modules/@typescript-eslint/eslint-plugin"
+      ],
+      "fixAvailable": true
+    },
+    "@typescript-eslint/parser": {
+      "name": "@typescript-eslint/parser",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@typescript-eslint/typescript-estree"
+      ],
+      "effects": [
+        "@typescript-eslint/eslint-plugin"
+      ],
+      "range": "3.10.2-alpha.0 - 8.2.1-alpha.25",
+      "nodes": [
+        "node_modules/@typescript-eslint/parser"
+      ],
+      "fixAvailable": true
+    },
+    "@typescript-eslint/type-utils": {
+      "name": "@typescript-eslint/type-utils",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@typescript-eslint/typescript-estree",
+        "@typescript-eslint/utils"
+      ],
+      "effects": [
+        "@typescript-eslint/eslint-plugin"
+      ],
+      "range": "5.9.2-alpha.0 - 8.2.1-alpha.25",
+      "nodes": [
+        "node_modules/@typescript-eslint/type-utils"
+      ],
+      "fixAvailable": true
+    },
+    "@typescript-eslint/typescript-estree": {
+      "name": "@typescript-eslint/typescript-estree",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "globby"
+      ],
+      "effects": [
+        "@typescript-eslint/parser",
+        "@typescript-eslint/type-utils",
+        "@typescript-eslint/utils"
+      ],
+      "range": "3.10.2-alpha.0 - 8.2.1-alpha.25",
+      "nodes": [
+        "node_modules/@typescript-eslint/typescript-estree"
+      ],
+      "fixAvailable": true
+    },
+    "@typescript-eslint/utils": {
+      "name": "@typescript-eslint/utils",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@typescript-eslint/typescript-estree"
+      ],
+      "effects": [
+        "@typescript-eslint/eslint-plugin",
+        "@typescript-eslint/type-utils"
+      ],
+      "range": "<=8.2.1-alpha.25",
+      "nodes": [
+        "node_modules/@typescript-eslint/utils"
+      ],
+      "fixAvailable": true
+    },
+    "braces": {
+      "name": "braces",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1240992,
+          "name": "braces",
+          "dependency": "braces",
+          "title": "braces vulnerable to stack-exhaustion denial of service through deeply nested patterns",
+          "url": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+          "severity": "high",
+          "cwe": [
+            "CWE-674"
+          ],
+          "cvss": {
+            "score": 7.5,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=3.0.3"
+        }
+      ],
+      "effects": [
+        "micromatch"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/braces"
+      ],
+      "fixAvailable": false
+    },
+    "decode-uri-component": {
+      "name": "decode-uri-component",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1147955,
+          "name": "decode-uri-component",
+          "dependency": "decode-uri-component",
+          "title": "decode-uri-component: Denial of service via exponential decoding of malformed percent-encoded input",
+          "url": "https://github.com/advisories/GHSA-vcc3-ghjq-m6fr",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-400",
+            "CWE-405",
+            "CWE-407",
+            "CWE-1176"
+          ],
+          "cvss": {
+            "score": 0,
+            "vectorString": null
+          },
+          "range": "<=0.4.2"
+        }
+      ],
+      "effects": [
+        "source-map-resolve"
+      ],
+      "range": "<=0.4.2",
+      "nodes": [
+        "node_modules/decode-uri-component"
+      ],
+      "fixAvailable": false
+    },
+    "elliptic": {
+      "name": "elliptic",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1112030,
+          "name": "elliptic",
+          "dependency": "elliptic",
+          "title": "Elliptic Uses a Cryptographic Primitive with a Risky Implementation",
+          "url": "https://github.com/advisories/GHSA-848j-6mx2-7j84",
+          "severity": "low",
+          "cwe": [
+            "CWE-1240"
+          ],
+          "cvss": {
+            "score": 5.6,
+            "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L"
+          },
+          "range": "<=6.6.1"
+        }
+      ],
+      "effects": [
+        "secp256k1"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/elliptic"
+      ],
+      "fixAvailable": {
+        "name": "near-api-js",
+        "version": "7.3.1",
+        "isSemVerMajor": true
+      }
+    },
+    "fast-glob": {
+      "name": "fast-glob",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "micromatch"
+      ],
+      "effects": [
+        "@ts-morph/common",
+        "globby"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/fast-glob"
+      ],
+      "fixAvailable": false
+    },
+    "globby": {
+      "name": "globby",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "fast-glob"
+      ],
+      "effects": [
+        "@typescript-eslint/typescript-estree"
+      ],
+      "range": ">=8.0.0",
+      "nodes": [
+        "node_modules/globby"
+      ],
+      "fixAvailable": true
+    },
+    "micromatch": {
+      "name": "micromatch",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "braces"
+      ],
+      "effects": [
+        "fast-glob"
+      ],
+      "range": ">=0.2.0",
+      "nodes": [
+        "node_modules/micromatch"
+      ],
+      "fixAvailable": false
+    },
+    "near-api-js": {
+      "name": "near-api-js",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@near-js/accounts",
+        "@near-js/crypto",
+        "@near-js/keystores",
+        "@near-js/keystores-browser",
+        "@near-js/keystores-node",
+        "@near-js/providers",
+        "@near-js/signers",
+        "@near-js/transactions",
+        "@near-js/wallet-account"
+      ],
+      "effects": [
+        "near-workspaces"
+      ],
+      "range": "4.0.4 - 6.5.1",
+      "nodes": [
+        "node_modules/near-api-js"
+      ],
+      "fixAvailable": {
+        "name": "near-api-js",
+        "version": "7.3.1",
+        "isSemVerMajor": true
+      }
+    },
+    "near-sdk-js": {
+      "name": "near-sdk-js",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "@typescript-eslint/parser",
+        "rollup-plugin-sourcemaps",
+        "ts-morph"
+      ],
+      "effects": [],
+      "range": "*",
+      "nodes": [
+        "node_modules/near-sdk-js"
+      ],
+      "fixAvailable": false
+    },
+    "near-workspaces": {
+      "name": "near-workspaces",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "near-api-js"
+      ],
+      "effects": [],
+      "range": ">=5.0.0",
+      "nodes": [
+        "node_modules/near-workspaces"
+      ],
+      "fixAvailable": {
+        "name": "near-workspaces",
+        "version": "4.0.0",
+        "isSemVerMajor": true
+      }
+    },
+    "rollup-plugin-sourcemaps": {
+      "name": "rollup-plugin-sourcemaps",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        "source-map-resolve"
+      ],
+      "effects": [
+        "near-sdk-js"
+      ],
+      "range": ">=0.5.0",
+      "nodes": [
+        "node_modules/rollup-plugin-sourcemaps"
+      ],
+      "fixAvailable": false
+    },
+    "secp256k1": {
+      "name": "secp256k1",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "elliptic"
+      ],
+      "effects": [
+        "@near-js/crypto"
+      ],
+      "range": ">=2.0.0",
+      "nodes": [
+        "node_modules/secp256k1"
+      ],
+      "fixAvailable": {
+        "name": "near-api-js",
+        "version": "7.3.1",
+        "isSemVerMajor": true
+      }
+    },
+    "source-map-resolve": {
+      "name": "source-map-resolve",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        "decode-uri-component"
+      ],
+      "effects": [
+        "rollup-plugin-sourcemaps"
+      ],
+      "range": ">=0.5.1",
+      "nodes": [
+        "node_modules/source-map-resolve"
+      ],
+      "fixAvailable": false
+    },
+    "ts-morph": {
+      "name": "ts-morph",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@ts-morph/common"
+      ],
+      "effects": [
+        "near-sdk-js"
+      ],
+      "range": "6.0.1 - 23.0.0 || 25.0.0 - 26.0.0",
+      "nodes": [
+        "node_modules/ts-morph"
+      ],
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 13,
+      "moderate": 3,
+      "high": 12,
+      "critical": 0,
+      "total": 28
+    },
+    "dependencies": {
+      "prod": 1,
+      "dev": 384,
+      "optional": 1,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 384
+    }
+  }
+}
