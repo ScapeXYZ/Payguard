@@ -38,6 +38,7 @@ async function fixture(t) {
   const worker = await Worker.init({ network: "sandbox" });
   t.after(() => worker.tearDown());
   const owner = await worker.rootAccount.createSubAccount("owner", { initialBalance: 100n * 10n ** 24n });
+  const guardian = await worker.rootAccount.createSubAccount("guardian");
   const agent = await owner.createSubAccount("agent", { initialBalance: 5n * 10n ** 24n });
   const alice = await owner.createSubAccount("alice", { initialBalance: 10n ** 24n });
   const stranger = await owner.createSubAccount("stranger", { initialBalance: 10n ** 24n });
@@ -54,7 +55,7 @@ async function fixture(t) {
     .addKey(backup.getPublicKey(), transactions.fullAccessKey())
     .addKey(guardFunctionKey.getPublicKey(), transactions.functionCallAccessKey(guard.accountId, ["pay"], 10n ** 24n))
     .deployContract(await readFile("build/guard.wasm"))
-    .functionCall("init", { owner_id: owner.accountId, agent_id: agent.accountId }, { gas: 30_000_000_000_000n })
+    .functionCall("init", { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId }, { gas: 30_000_000_000_000n })
     .transact();
   assert.equal(deployment.failed, false);
   await token.deploy("build/mock-ft.wasm");
@@ -115,11 +116,11 @@ async function fixture(t) {
   assert.equal((await guard.view("get_policy", { token_id: token.accountId })).max_per_payment, "45000000");
   await owner.call(guard, "set_policy", policy);
   await activatePending(worker, stranger, guard);
-  assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId });
+  assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId });
   const payment = { token_id: token.accountId, recipient_id: alice.accountId, amount: "40000000" };
   const options = { gas: 80_000_000_000_000n, attachedDeposit: 0n, signWithKey: restricted };
   let sequence = 0;
-  return { worker, owner, agent, alice, stranger, guard, token, policy, payment, options,
+  return { worker, owner, guardian, agent, alice, stranger, guard, token, policy, payment, options,
     pay: (input = payment) => agent.call(guard, "pay", { request_id: "sandbox-" + ++sequence, ...input }, options),
     spending: (args = {}) => guard.view("get_spending", { token_id: token.accountId, ...args }),
     balance: (account) => token.view("ft_balance_of", { account_id: account.accountId }),
@@ -252,4 +253,43 @@ test("Sandbox: owner cap raise cannot pay or activate early; exact pending polic
   assert.equal(await f.guard.view("get_pending_policy"), null);
   await assert.rejects(f.stranger.call(f.guard, "activate_policy", { proposal_id: stale.proposal_id }), /no_pending_policy/);
   await assert.rejects(f.pay(), /unknown_token/);
+});
+
+test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment isolation", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  await f.pay({ ...f.payment, request_id: "recovery-ledger" });
+  const spent = await f.spending();
+  await f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" });
+  const vetoed = await f.guard.view("get_pending_policy");
+  await assert.rejects(f.stranger.call(f.guard, "cancel_policy", {}), /owner_or_guardian_only/);
+  await assert.rejects(f.owner.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId }), /guardian_only/);
+  await assert.rejects(f.stranger.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId }), /guardian_only/);
+  await f.guardian.call(f.guard, "cancel_policy", {});
+  await assert.rejects(f.stranger.call(f.guard, "activate_policy", { proposal_id: vetoed.proposal_id }), /no_pending_policy/);
+  await assert.rejects(f.pay({ ...f.payment, amount: "60000000" }), /max_per_payment/);
+  await assert.rejects(f.guardian.call(f.guard, "pay", { ...f.payment, request_id: "guardian-pay" }, { gas: f.options.gas }), /agent_only/);
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const pending = await f.guard.view("get_pending_owner_recovery");
+  await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: pending.proposal_id }), /identity_timelocked/);
+  await assert.rejects(f.stranger.call(f.guard, "set_policy", f.policy), /owner_only/);
+  await f.owner.call(f.guard, "cancel_policy", {});
+  await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
+  for (let jumps = 0; jumps < 40; jumps++) {
+    const block = await f.worker.provider.block({ finality: "final" });
+    if (BigInt(block.header.timestamp_nanosec) >= BigInt(pending.activate_after)) break;
+    await f.worker.provider.fastForward(1_000_000);
+  }
+  const block = await f.worker.provider.block({ finality: "final" });
+  assert.ok(BigInt(block.header.timestamp_nanosec) >= BigInt(pending.activate_after));
+  await f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: pending.proposal_id });
+  assert.equal((await f.guard.view("get_config")).owner_id, f.stranger.accountId);
+  await assert.rejects(f.owner.call(f.guard, "set_policy", f.policy), /owner_only/);
+  await f.stranger.call(f.guard, "set_policy", { ...f.policy, daily_limit: "80000000" });
+  assert.equal((await f.guard.view("get_policy", { token_id: f.token.accountId })).daily_limit, "80000000");
+  assert.equal((await f.spending({ day: spent.day })).spent, "40000000");
+  await assert.rejects(f.pay({ ...f.payment, request_id: "recovery-ledger" }), /duplicate_request/);
+  await f.pay(); await f.pay();
+  await assert.rejects(f.pay(), /daily_limit/);
+  assert.deepEqual((await f.guard.viewAccessKeys(f.guard.accountId)).keys, []);
+  await assert.rejects(f.agent.call(f.guard, "propose_owner_recovery", { owner_id: f.owner.accountId }, f.options), { type: "MethodNameMismatch" });
 });
