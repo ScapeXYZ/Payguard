@@ -9,4 +9,4 @@ Team: Temi (backend, checks + break-it tests) and Lauki (agent side, demo).
 5. **Nov 11-13:** demo page + video.
 6. **By Nov 14:** submit to the NEAR hackathon (earlier if solid). One submission per team.
 
-Next: X Layer TapeOut Accelerate (runs to Dec 7), port payguard Nov 15 - Dec 7.
+Scope: NEAR only.
