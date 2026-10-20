@@ -28,4 +28,9 @@ test("blocks above daily limit", () => {
   assert.equal(d.allow, false);
 });
 
+test("blocks a token with no configured payment or daily limit", () => {
+  const d = checkPayment({ to: "alice.near", amount: 1000, token: "UNKNOWN" }, policy);
+  assert.equal(d.allow, false, "a completely unconfigured token must not bypass spending limits");
+});
+
 // TODO(temi): break it. negative/NaN amounts, case tricks on addresses, token spoofing, splitting one big payment into many small ones.
