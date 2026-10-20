@@ -123,8 +123,18 @@ replacement account and `activate_after` in nanoseconds. Inspect with
 `get_pending_owner_recovery()`. Creation clears pending policy and guardian change.
 Recovery freezes all policy loosening, including enablement, and policy activation;
 owner tightening, disabling and cancellation remain available. Existing bounded
-agent payments continue. There is no recovery cancellation method, including for
-the owner. Guardian corrections require a new proposal and a fresh full delay.
+agent payments continue. Owner-only `cancel_owner_recovery()` uses the current
+NEAR `predecessor_account_id`, requires zero deposit, and immediately clears the
+pending recovery without a timelock or guardian approval, even after its deadline
+if activation has not executed. Guardian, agent and third parties cannot cancel.
+Canceled activation rejects with `no_pending_identity`, including after the former
+deadline. Cancellation releases the recovery freeze but does not restore proposals
+cleared when recovery began. It changes no active identity, policy, spending or
+replay marker. Calling it without a pending recovery is an authorized no-op.
+Every new or replacement proposal gets a new ID and a fresh full 24-hour delay;
+cancellation never resets the sequence or preserves a reusable deadline.
+Neither proposing nor activating recovery requires an owner signature, so a truly
+lost owner key does not block recovery.
 Permissionless `activate_owner_recovery({proposal_id})` requires the current ID
 and trusted block timestamp at least 24 hours after proposal. Only then does the
 new owner acquire policy administration and the old owner lose it. The new owner
@@ -142,10 +152,15 @@ accepted. Stale IDs reject; successful activation clears its proposal.
 
 Use a separately controlled guardian account, preferably with independent custody
 and monitoring. Account separation cannot prove separate key custody. A compromised
-guardian can veto indefinitely, freeze loosening and replace the owner after 24
-hours, eventually enabling malicious policy after its additional policy delay.
+guardian can veto policy indefinitely and repeatedly propose recovery to freeze
+loosening/activation and clear pending proposals. Owner cancellation releases the
+current freeze, but the guardian can propose again: sustained policy administration
+availability is not guaranteed. No rate limit or guardian-removal change is included.
+If the owner does not cancel before activation, the guardian can replace it after
+24 hours, eventually enabling malicious policy after the additional policy delay.
 It has no direct payment, transfer, key-installation or policy-setting authority.
-An owner cannot stop a malicious guardian recovery. Delayed guardian succession is
+The owner must monitor and execute cancellation before recovery activation; once
+activation executes the old owner loses veto authority. Delayed guardian succession is
 not protection against persistent compromise of the current guardian. Loss of the
 guardian prevents recovery and guardian replacement; no owner override exists.
 Account syntax validation does not prove replacement existence or usable authority;
@@ -156,5 +171,6 @@ Recovery preserves the zero-key guard architecture, immutable payment agent,
 policy limits, UTC spending history and lifetime request markers. It cannot cancel
 already scheduled transfers, repair token code, upgrade WASM, recover arbitrary
 assets, restore guard access keys or replenish the restricted agent's allowance.
-The old owner can still cause denial of service by tightening/disabling during
-the recovery window. Ordinary allowed payments remain exposed during that window.
+A compromised current owner can veto guardian recovery repeatedly; this veto
+protects a responsive legitimate owner but cannot distinguish compromise from
+legitimate control. The old owner can also tighten/disable during the recovery window. Ordinary allowed payments remain exposed during that window.

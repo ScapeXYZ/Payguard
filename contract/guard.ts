@@ -2,7 +2,7 @@ import { NearBindgen, near, call, view, initialize, NearPromise } from "near-sdk
 import {
   initialize as initializeConfig, setPolicy, reserve, getPolicy, getSpending, dayAt, TRANSFER_GAS,
   activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
-  proposeOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
+  proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
   proposeGuardianChange, activateGuardianChange, getPendingGuardianChange,
   type Host, type Payment,
 } from "./policy";
@@ -50,6 +50,9 @@ class PayGuard {
 
   @call({})
   propose_owner_recovery({ owner_id }: { owner_id: string }): void { proposeOwnerRecovery(host, this, owner_id); }
+
+  @call({})
+  cancel_owner_recovery(): void { cancelOwnerRecovery(host, this); }
 
   @view({})
   get_pending_owner_recovery() { return getPendingOwnerRecovery(host); }
