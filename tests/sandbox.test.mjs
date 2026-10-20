@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Worker } from "near-workspaces";
 import { KeyPair, transactions } from "near-api-js";
 import { readFile } from "node:fs/promises";
+import { lockGuard } from "../scripts/lock-guard.mjs";
 
 // Explicit network avoids environment-driven testnet selection. No public RPCs.
 async function fixture(t) {
@@ -14,10 +15,16 @@ async function fixture(t) {
   const stranger = await owner.createSubAccount("stranger", { initialBalance: 10n ** 24n });
   const guard = owner.getSubAccount("guard");
   const token = await owner.createSubAccount("usdc", { initialBalance: 10n * 10n ** 24n });
+  const guardSigner = KeyPair.fromRandom("ed25519");
+  const backup = KeyPair.fromRandom("ed25519");
+  const guardFunctionKey = KeyPair.fromRandom("ed25519");
   // Deployment + initialization in one transaction from trusted owner.
   const deployment = await owner.batch(guard)
     .createAccount()
     .transfer(10n ** 25n)
+    .addKey(guardSigner.getPublicKey(), transactions.fullAccessKey())
+    .addKey(backup.getPublicKey(), transactions.fullAccessKey())
+    .addKey(guardFunctionKey.getPublicKey(), transactions.functionCallAccessKey(guard.accountId, ["pay"], 10n ** 24n))
     .deployContract(await readFile("build/guard.wasm"))
     .functionCall("init", { owner_id: owner.accountId, agent_id: agent.accountId }, { gas: 30_000_000_000_000n })
     .transact();
@@ -40,6 +47,45 @@ async function fixture(t) {
   assert.equal(access.permission.FunctionCall.receiver_id, guard.accountId);
   assert.deepEqual(access.permission.FunctionCall.method_names, ["pay"]);
   assert.equal(access.permission.FunctionCall.allowance, allowance.toString());
+  // Prove agent predecessor authentication before retiring its setup authority.
+  await assert.rejects(agent.call(token, "forward_pay", {
+    guard_id: guard.accountId,
+    payment: { request_id: "relay-before-lock", token_id: token.accountId,
+      recipient_id: alice.accountId, amount: "1" },
+  }, { gas: 150_000_000_000_000n }), /agent_only/);
+  await assert.rejects(agent.call(guard, "pay", {
+    request_id: "deposit-before-lock", token_id: token.accountId,
+    recipient_id: alice.accountId, amount: "1",
+  }, { gas: 80_000_000_000_000n, attachedDeposit: 1n }), /not payable/i);
+  await assert.rejects(agent.call(guard, "set_policy", policy), /owner_only/);
+  const agentSetupKey = await agent.getKey();
+  const retired = await agent.batch(agent).deleteKey(agentSetupKey.getPublicKey()).transact();
+  assert.equal(retired.failed, false);
+  const agentKeys = await agent.viewAccessKeys(agent.accountId);
+  assert.equal(agentKeys.keys.length, 1);
+  assert.equal(agentKeys.keys[0].public_key, restricted.getPublicKey().toString());
+
+  const ownerKeys = await owner.viewAccessKeys(owner.accountId);
+  const before = await guard.viewAccessKeys(guard.accountId);
+  assert.equal(before.keys.length, 3);
+  assert.equal(before.keys.filter(k => k.access_key.permission === "FullAccess").length, 2);
+  await assert.rejects(lockGuard({ guard, provider: worker.provider, signingKey: guardSigner,
+    ownerId: owner.accountId, agentId: agent.accountId }), /explicit_irreversible_lock_confirmation_required/);
+  assert.equal((await guard.viewAccessKeys(guard.accountId)).keys.length, 3);
+  await lockGuard({ guard, provider: worker.provider, signingKey: guardSigner,
+    ownerId: owner.accountId, agentId: agent.accountId,
+    confirmation: `LOCK ${guard.accountId} IRREVERSIBLY` });
+  // Actual RPC list, not local keystore inspection or Sandbox state patching.
+  assert.deepEqual((await guard.viewAccessKeys(guard.accountId)).keys, []);
+  assert.deepEqual((await owner.viewAccessKeys(owner.accountId)).keys, ownerKeys.keys);
+  assert.deepEqual((await agent.viewAccessKeys(agent.accountId)).keys, agentKeys.keys);
+  // near-api-js queries on-chain keys before signing and refuses the deleted key.
+  await assert.rejects(guard.batch(guard).transfer(1n).transact(guardSigner),
+    /no matching key pair exists/);
+  await owner.call(guard, "set_policy", { ...policy, max_per_payment: "45000000" });
+  assert.equal((await guard.view("get_policy", { token_id: token.accountId })).max_per_payment, "45000000");
+  await owner.call(guard, "set_policy", policy);
+  assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId });
   const payment = { token_id: token.accountId, recipient_id: alice.accountId, amount: "40000000" };
   const options = { gas: 80_000_000_000_000n, attachedDeposit: 0n, signWithKey: restricted };
   let sequence = 0;
@@ -50,7 +96,7 @@ async function fixture(t) {
   };
 }
 
-test("Sandbox: three separate signed 40 USDC transactions reject third and actually move guard funds", { timeout: 180000 }, async (t) => {
+test("Sandbox: deletes every guard key then three signed 40 USDC transactions reject third", { timeout: 180000 }, async (t) => {
   const f = await fixture(t);
   await f.pay();
   assert.equal(await f.balance(f.alice), "40000000");
@@ -76,11 +122,10 @@ test("Sandbox: predecessor authorization, owner policy, input validation, and no
     await assert.rejects(caller.call(f.guard, "pay", f.payment, { gas: f.options.gas }), /agent_only/);
   }
   // Full-access test signer deliberately bypasses the method key boundary to test contract authentication.
-  await assert.rejects(f.agent.call(f.guard, "set_policy", f.policy), /owner_only/);
   await assert.rejects(f.stranger.call(f.guard, "set_policy", f.policy), /owner_only/);
   await assert.rejects(f.owner.call(f.guard, "init", { owner_id: f.owner.accountId, agent_id: f.agent.accountId }));
   for (const method of ["reset_spending", "withdraw", "ft_transfer"]) {
-    await assert.rejects(f.agent.call(f.guard, method, {}));
+    await assert.rejects(f.stranger.call(f.guard, method, {}));
   }
   const { token_id, ...missingToken } = f.payment;
   await assert.rejects(f.pay(missingToken), /bad_account_id/);
@@ -93,7 +138,7 @@ test("Sandbox: predecessor authorization, owner policy, input validation, and no
     await assert.rejects(f.agent.call(f.guard, "pay", { ...f.payment, request_id: "gas-test" }, { ...f.options, gas }), /pay_gas_out_of_range/);
   }
   await assert.rejects(f.agent.call(f.guard, "pay", { ...f.payment, request_id: "deposit-test" },
-    { gas: f.options.gas, attachedDeposit: 1n }), /not payable/i);
+    { ...f.options, attachedDeposit: 1n }), { type: "DepositWithFunctionCall" });
   await f.pay();
   await f.owner.call(f.guard, "set_policy", { ...f.policy, token_id: token_id.toUpperCase() });
   assert.equal((await f.spending()).spent, "40000000");
@@ -131,7 +176,7 @@ test("Sandbox: failed ft_transfer leaves reservation and funds; UTC day rollover
 test("Sandbox: duplicate requests cannot pay twice or change payload to reuse an ID", { timeout: 180000 }, async (t) => {
   const f = await fixture(t);
   const payment = { ...f.payment, request_id: "invoice-1" };
-  await assert.rejects(f.agent.call(f.token, "forward_pay", {
+  await assert.rejects(f.owner.call(f.token, "forward_pay", {
     guard_id: f.guard.accountId, payment,
   }, { gas: 150_000_000_000_000n }), /agent_only/);
   await assert.rejects(f.agent.call(f.guard, "pay", f.payment, f.options), /bad_request_id/);

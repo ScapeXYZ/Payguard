@@ -110,7 +110,8 @@ committed receipt. NEAR deposit refunds are not budget refunds.
 An uninitialized public deployment can be claimed by a caller naming itself
 owner. The supported lifecycle creates, deploys and initializes a new guard in
 one owner-signed action batch, tested in Sandbox; never split that batch. Owner
-configuration and any retained guard full-access signing keys remain trusted.
+configuration remains trusted. Guard full-access signing keys are trusted only
+during setup; the required post-initialization lock removes every guard key.
 Approved token code can lie or be upgraded; syntax validation is not token-code
 verification. Recipients can forward tokens after receipt. Historical spending
 and request markers require storage; the contract has no cleanup or emergency
@@ -134,7 +135,8 @@ midnight, so the cap is not a bound on total settlement within a UTC calendar da
   methods exactly `["pay"]`, finite 1 NEAR allowance. It verifies protocol errors
   `ReceiverMismatch`, `MethodNameMismatch`, `DepositWithFunctionCall`, and
   `RequiresFullAccess`. The restricted signing options never receive an owner key;
-  fixtures retain operator full-access keys for setup and negative tests. Production
+  fixtures retire the agent setup key and delete all guard keys before payment
+  scenarios, while the owner retains its own authority. Production
   key custody must still follow the documented setup; it cannot be proved by WASM.
 - **Token / recipient:** ASCII canonical lowercase account IDs, length 2–64,
   valid nonconsecutive separators; no symbol aliases. Both policy limits must be
@@ -161,7 +163,29 @@ midnight, so the cap is not a bound on total settlement within a UTC calendar da
   `get_config`, `get_policy`, `get_spending`. The views do not write state or
   schedule calls. No raw transfer, arbitrary call, reset or callback is exported.
   The agent key permits only `pay`; even a key configuration mistake would still
-  face contract ACLs. A full guard-account key remains an explicitly trusted escape.
+  face contract ACLs. The zero-key guard has no account-key escape or self-upgrade method.
+
+## Guard account lock
+
+The supported lifecycle ends with zero guard access keys. The operator procedure
+in `scripts/lock-guard.mjs` enumerates the finalized on-chain list and submits
+ordinary `DeleteKey` actions in a guard-signed batch, deleting its signing key
+last. It never asks WASM to enumerate keys. Verification waits for a finalized
+snapshot at or after the deletion receipt's block and requires an empty list.
+A transaction response alone or removing local credentials is insufficient.
+
+Sandbox starts with two full-access keys and one function-call key, deletes all
+three without state patching, and queries the actual key list. It checks missing
+confirmation leaves keys intact, owner keys remain unchanged, and the agent has
+exactly its restricted `pay` key. The deleted guard signer is refused by the
+SDK's on-chain key lookup. Owner policy changes and restricted-agent payments
+run after locking, including the separate 40 + 40 + rejected 40 scenario.
+
+The current contract exposes no upgrade, key installation or recovery path, so
+this lock is irreversible. The owner retains policy administration only. The
+agent's removal of full-access authority also prevents key rotation and finite
+allowance replenishment. See [the operational runbook](key-management.md) for
+explicit real-network confirmation and migration/recovery limitations.
 
 ## Other dependency risks and compatibility
 
