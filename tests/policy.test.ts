@@ -17,7 +17,7 @@ function fixture() {
     attachedDeposit: () => deposit, prepaidGas: () => gas, timestamp: () => now,
     read: (key) => storage.get(key) ?? null, write: (key, value) => { storage.set(key, value); },
   };
-  const config = initialize(host, caller, "agent.test.near", "guardian.test.near");
+  const config = initialize(host, caller, "agent.test.near", "guardian.test.near", "cold.near");
   const policy = {
     token_id: "usdc.test.near", max_per_payment: "50000000", daily_limit: "100000000",
     recipients: ["alice.test.near"],
@@ -151,10 +151,10 @@ test("zero deposit and bounded prepaid gas are mandatory", () => {
 
 test("trusted initialization requires distinct owner, agent, guard and authentic owner", () => {
   const f = fixture();
-  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, "guardian.test.near"), /owner_only/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, "guardian.test.near", "cold.near"), /owner_only/);
   f.caller(f.config.owner_id);
-  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.owner_id, "guardian.test.near"), /separate_agent_required/);
-  assert.throws(() => initialize(f.host, f.config.owner_id, "guard.test.near", "guardian.test.near"), /separate_agent_required/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, f.config.owner_id, "guardian.test.near", "cold.near"), /separate_agent_required/);
+  assert.throws(() => initialize(f.host, f.config.owner_id, "guard.test.near", "guardian.test.near", "cold.near"), /separate_agent_required/);
 });
 
 test("policy validation is complete before write, and empty recipients pause payments", () => {
@@ -405,7 +405,7 @@ test("guardian changes accept owner or current guardian and a full delay; identi
   const f = fixture();
   f.caller(f.config.owner_id);
   for (const id of [f.config.owner_id, f.config.agent_id, "guard.test.near"]) {
-    assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, id), /separate_guardian_required/);
+    assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, id, "cold.near"), /separate_guardian_required/);
   }
   f.caller("stranger.near");
   assert.throws(() => proposeGuardianChange(f.host, f.config, "next.near"), /owner_or_guardian_only/);
@@ -612,4 +612,58 @@ test("guardian can veto mature and guardian-proposed changes; former guardian lo
   assert.ok(getPendingGuardianChange(f.host));
   f.caller(f.config.guardian_id); cancelGuardianChange(f.host, f.config);
   assert.equal(getPendingGuardianChange(f.host), null);
+});
+
+test("cold exit is canonical, distinct, immutable through identity rotation", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  for (const exit of [undefined, "Cold.near", "cold.near\n", "a..near", f.config.owner_id, f.config.agent_id, f.config.guardian_id, "guard.test.near"]) {
+    assert.throws(() => initialize(f.host, f.config.owner_id, f.config.agent_id, f.config.guardian_id, exit));
+  }
+  assert.equal(f.config.exit_id, "cold.near");
+  assert.throws(() => proposeGuardianChange(f.host, f.config, f.config.exit_id), /separate_replacement/);
+  f.caller(f.config.guardian_id);
+  assert.throws(() => proposeOwnerRecovery(f.host, f.config, f.config.exit_id), /separate_replacement/);
+});
+
+test("sweep authorization, locks, stale callbacks, gas, deposits and independent tokens", async () => {
+  const { beginSweep, finishSweep } = await import("../contract/policy.ts");
+  const f = fixture(); f.gas(200_000_000_000_000n);
+  for (const caller of [f.config.agent_id, "stranger.near", "guard.test.near"]) {
+    f.caller(caller); assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id), /owner_or_guardian_only/);
+  }
+  f.caller(f.config.owner_id); f.deposit(1n);
+  assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id), /zero_deposit/);
+  f.deposit(0n); f.gas(179_999_999_999_999n);
+  assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id), /sweep_gas/);
+  f.gas(200_000_000_000_000n);
+  const before = f.snapshot();
+  const first = beginSweep(f.host, f.config, f.policy.token_id); f.reload();
+  assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id.toUpperCase()), /sweep_pending/);
+  f.caller(f.config.agent_id); f.gas(MIN_PAY_GAS); assert.throws(() => f.tx(), /sweep_pending/); f.gas(200_000_000_000_000n);
+  f.caller(f.config.guardian_id); beginSweep(f.host, f.config, "other.near");
+  assert.throws(() => finishSweep(f.host, first.token_id, first.sweep_id), /private_callback/);
+  f.caller("guard.test.near"); finishSweep(f.host, first.token_id, first.sweep_id);
+  assert.throws(() => finishSweep(f.host, first.token_id, first.sweep_id), /stale_sweep/);
+  f.caller(f.config.owner_id); const next = beginSweep(f.host, f.config, first.token_id);
+  assert.notEqual(next.sweep_id, first.sweep_id);
+  assert.deepEqual(f.snapshot().filter(([k]) => !k.startsWith("sweep")), before);
+});
+
+test("pending identities cannot freeze sweep; former identities lose authority", async () => {
+  const { beginSweep, finishSweep } = await import("../contract/policy.ts");
+  for (const recovery of [true, false]) {
+    const f = fixture(); f.gas(200_000_000_000_000n);
+    const former = recovery ? f.config.owner_id : f.config.guardian_id;
+    f.caller(recovery ? f.config.guardian_id : f.config.owner_id);
+    if (recovery) proposeOwnerRecovery(f.host, f.config, "next.near");
+    else proposeGuardianChange(f.host, f.config, "next.near");
+    f.caller(former); const pending = beginSweep(f.host, f.config, f.policy.token_id);
+    f.caller("guard.test.near"); finishSweep(f.host, pending.token_id, pending.sweep_id);
+    const proposal = (recovery ? getPendingOwnerRecovery : getPendingGuardianChange)(f.host)!;
+    f.time(BigInt(proposal.activate_after));
+    (recovery ? activateOwnerRecovery : activateGuardianChange)(f.host, f.config, proposal.proposal_id);
+    assert.equal(f.config.exit_id, "cold.near"); f.caller(former);
+    assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id), /owner_or_guardian_only/);
+    f.caller("next.near"); beginSweep(f.host, f.config, f.policy.token_id);
+  }
 });

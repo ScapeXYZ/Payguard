@@ -47,14 +47,14 @@ export type Host = {
   read(key: string): string | null;
   write(key: string, value: string): void;
 };
-export type Config = { owner_id: string; agent_id: string; guardian_id: string };
+export type Config = { owner_id: string; agent_id: string; guardian_id: string; readonly exit_id: string };
 export type Payment = { request_id: string; token_id: string; recipient_id: string; amount: string };
 
 function zeroDeposit(host: Host): void {
   requireThat(host.attachedDeposit() === 0n, "zero_deposit_required");
 }
 
-export function initialize(host: Host, owner: unknown, agent: unknown, guardian: unknown): Config {
+export function initialize(host: Host, owner: unknown, agent: unknown, guardian: unknown, exit: unknown): Config {
   zeroDeposit(host);
   const owner_id = accountId(owner);
   const agent_id = accountId(agent);
@@ -63,7 +63,10 @@ export function initialize(host: Host, owner: unknown, agent: unknown, guardian:
   requireThat(owner_id !== host.currentAccount(), "separate_owner_required");
   const guardian_id = accountId(guardian);
   requireThat(![owner_id, agent_id, host.currentAccount()].includes(guardian_id), "separate_guardian_required");
-  return { owner_id, agent_id, guardian_id };
+  const exit_id = accountId(exit);
+  requireThat(exit === exit_id, "canonical_exit_required");
+  requireThat(![owner_id, agent_id, guardian_id, host.currentAccount()].includes(exit_id), "separate_exit_required");
+  return { owner_id, agent_id, guardian_id, exit_id };
 }
 
 export function setPolicy(host: Host, config: Config, input: {
@@ -163,6 +166,7 @@ export function reserve(host: Host, config: Config, input: Payment): Payment {
   const token_id = accountId(input.token_id);
   const recipient_id = accountId(input.recipient_id);
   const units = amount(input.amount);
+  requireThat(host.read("sweep:" + token_id) === null || host.read("sweep:" + token_id) === "null", "sweep_pending");
   const policy = getPolicy(host, token_id);
   requireThat(policy !== null, "unknown_token");
   requireThat(policy.recipients.includes(recipient_id), "unapproved_recipient");
@@ -203,7 +207,7 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
     }
   }
   const account_id = accountId(replacement);
-  requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
+  requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
   const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
   host.write("identity_sequence", proposal_id);
   host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", JSON.stringify({
@@ -244,7 +248,7 @@ function activateIdentity(host: Host, config: Config, proposalId: unknown, recov
   requireThat(pending !== null, "no_pending_identity");
   requireThat(pending.proposal_id === proposalId, "proposal_id_mismatch");
   requireThat(host.timestamp() >= BigInt(pending.activate_after), "identity_timelocked");
-  requireThat(![config.owner_id, config.agent_id, config.guardian_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
+  requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
   if (recovery) {
     config.owner_id = pending.account_id;
     // The former owner's pending administration cannot survive ownership recovery.
@@ -261,4 +265,26 @@ export function activateOwnerRecovery(host: Host, config: Config, proposalId: un
 }
 export function activateGuardianChange(host: Host, config: Config, proposalId: unknown): void {
   activateIdentity(host, config, proposalId, false);
+}
+
+// A lock spans balance discovery and transfer settlement. IDs never reset.
+export function beginSweep(host: Host, config: Config, token: unknown): { token_id: string; sweep_id: string } {
+  zeroDeposit(host);
+  requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
+  requireThat(host.prepaidGas() >= 180_000_000_000_000n && host.prepaidGas() <= 250_000_000_000_000n, "sweep_gas_out_of_range");
+  const token_id = accountId(token);
+  requireThat(token_id !== host.currentAccount(), "invalid_token_contract");
+  requireThat(host.read("sweep:" + token_id) === null || host.read("sweep:" + token_id) === "null", "sweep_pending");
+  const sweep_id = (BigInt(host.read("sweep_sequence") ?? "0") + 1n).toString();
+  host.write("sweep_sequence", sweep_id);
+  host.write("sweep:" + token_id, sweep_id);
+  return { token_id, sweep_id };
+}
+export function checkSweep(host: Host, token: string, id: string): void {
+  requireThat(host.predecessor() === host.currentAccount(), "private_callback");
+  requireThat(host.read("sweep:" + token) === id, "stale_sweep");
+}
+export function finishSweep(host: Host, token: string, id: string): void {
+  checkSweep(host, token, id);
+  host.write("sweep:" + token, "null");
 }

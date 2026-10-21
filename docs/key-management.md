@@ -1,6 +1,6 @@
 # Deployment and irreversible key lock
 
-The owner, agent, guardian, and guard are four distinct accounts. The owner administers
+The owner, agent, guardian, guard, and cold exit are five distinct accounts. The owner administers
 `set_policy` by signing transactions on the **owner account**, with guard as
 receiver. Incoming contract calls need no guard access key. The agent similarly
 signs on its own account. Parent/subaccount naming grants no continuing authority
@@ -23,7 +23,7 @@ or credential loader and tests use only ephemeral Sandbox accounts.
 2. Create separate owner, agent and independently controlled guardian accounts. In one **owner-signed transaction**
    to a new guard child, execute `CreateAccount`, `Transfer` for storage/deposits,
    `AddKey` for a temporary operator full-access public key, `DeployContract`,
-   then `FunctionCall("init", {owner_id, agent_id, guardian_id}, 30 Tgas, 0)`.
+   then `FunctionCall("init", {owner_id, agent_id, guardian_id, exit_id}, 30 Tgas, 0)`.
    Never expose a deployed but uninitialized guard.
 3. Verify finalized code hash and `get_config`. Owner signs `set_policy` to guard
    with zero deposit. Inspect `get_pending_policy`; initial token enablement waits
@@ -108,7 +108,7 @@ recovery is not guaranteed. This tradeoff requires explicit operator acceptance.
 
 ## Guardian and owner recovery lifecycle
 
-New deployments require `guardian_id` in `init` and return it in `get_config`.
+New deployments require `guardian_id` and `exit_id` in `init` and return both in `get_config`.
 Owner, agent, guardian and guard must all be distinct. Configuration is persistent
 SDK-managed on-chain state; authorization always uses NEAR predecessor, never
 signer or a supplied identity. This initialization API is incompatible with older
@@ -195,3 +195,29 @@ assets, restore guard access keys or replenish the restricted agent's allowance.
 A compromised current owner can veto guardian recovery repeatedly; this veto
 protects a responsive legitimate owner but cannot distinguish compromise from
 legitimate control. The old owner can also tighten/disable during the recovery window. Ordinary allowed payments remain exposed during that window.
+
+## Cold exit custody and operation
+
+Initialization now also requires `exit_id`; verify it in finalized `get_config`
+before deleting guard keys. Use a canonical lowercase, independently controlled
+cold account separate from guard, owner, agent and guardian. Verify its existence
+and recovery/key custody independently: account syntax checks cannot establish
+control. The destination cannot be changed after initialization, even through
+owner recovery or guardian rotation. Never reuse cold custody as a replacement
+owner or guardian.
+
+Register exit and guard separately on every intended NEP-141 token using the
+token's storage registration flow and trusted funds. Verify registration before
+funding. Keep a verified inventory of token contract IDs from incoming transfers;
+PayGuard cannot enumerate all assets. In an emergency, current owner or guardian
+signs `emergency_sweep({token_id})` to guard with 200 Tgas and zero deposit for
+**each** token. No guard key is needed, and the agent's key remains restricted to
+`pay`. Check the returned status and final balances, including failed receipts;
+`transfer_failed` and `balance_query_failed` are not success. Register a missing
+exit on the token, then retry. Zero balance returns `zero_balance`.
+
+Monitor in-flight payments and deposits; snapshot races may require a fresh sweep.
+Do not assume this drains native NEAR or undiscovered tokens. Do not assume a
+successful outer transaction proves transfer. Missing/panicked callbacks can leave
+an unrecoverable token lock; no timeout, reset or deployment escape is provided.
+See [the complete sweep semantics](../README.md#emergency-cold-exit-pr-10).
