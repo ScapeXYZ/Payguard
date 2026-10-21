@@ -479,3 +479,75 @@ test("Sandbox: cold exit sweeps full balances, fails safely and serializes recei
   for (let i = 0; i < 2; i++) assert.equal(await f.owner.call(f.guard, "emergency_sweep", { token_id: f.stranger.accountId }, opts), "balance_query_failed");
   assert.equal((await f.guard.view("get_config")).exit_id, f.exit.accountId);
 });
+
+test("Sandbox: cold-key recovery resists veto before and after deadline and survives owner activation", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  const next = await f.owner.createSubAccount("cold-next", { initialBalance: 10n ** 24n });
+  const waitUntil = async (deadline) => {
+    for (let jumps = 0; jumps < 40; jumps++) {
+      if (BigInt((await f.worker.provider.block({ finality: "final" })).header.timestamp_nanosec) >= BigInt(deadline)) return;
+      await f.worker.provider.fastForward(1_000_000);
+    }
+    assert.fail("Sandbox clock did not reach deadline");
+  };
+  const args = { guardian_id: next.accountId };
+  await f.pay({ ...f.payment, request_id: "cold-ledger" });
+  const spent = await f.spending();
+  for (const caller of [f.owner, f.guardian, f.stranger, next]) {
+    await assert.rejects(caller.call(f.guard, "propose_cold_key_guardian_change", args), /exit_only/);
+  }
+  await assert.rejects(f.agent.call(f.guard, "propose_cold_key_guardian_change", args, f.options), { type: "MethodNameMismatch" });
+  await assert.rejects(f.exit.call(f.token, "forward_identity", {
+    guard_id: f.guard.accountId, method: "propose_cold_key_guardian_change", args,
+  }, { gas: 100_000_000_000_000n }), /exit_only/);
+  await assert.rejects(f.exit.call(f.guard, "propose_cold_key_guardian_change", args, { attachedDeposit: 1n }));
+  for (const account of [f.owner, f.agent, f.guardian, f.exit, f.guard]) {
+    await assert.rejects(f.exit.call(f.guard, "propose_cold_key_guardian_change", { guardian_id: account.accountId }), /separate_replacement_required/);
+  }
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  await f.owner.call(f.guard, "cancel_owner_recovery", {});
+  const cooldown = await f.guard.view("get_recovery_cooldown");
+  await f.owner.call(f.guard, "propose_guardian_change", args);
+  const ordinary = await f.guard.view("get_pending_guardian_change");
+  const before = await f.worker.provider.block({ finality: "final" });
+  await f.exit.call(f.guard, "propose_cold_key_guardian_change", args);
+  const first = await f.guard.view("get_pending_guardian_change");
+  assert.equal(first.cold_key_proposed, true);
+  assert.ok(BigInt(first.activate_after) >= BigInt(before.header.timestamp_nanosec) + 86_400_000_000_000n);
+  assert.ok(BigInt(first.proposal_id) > BigInt(ordinary.proposal_id));
+  assert.equal(await f.guard.view("get_recovery_cooldown"), cooldown);
+  await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /cold_key_guardian_change_pending/);
+  for (const caller of [f.owner, f.guardian]) {
+    await assert.rejects(caller.call(f.guard, "propose_guardian_change", args), /cold_key_guardian_change_pending/);
+  }
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /identity_timelocked/);
+  await waitUntil(cooldown);
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  const recovery = await f.guard.view("get_pending_owner_recovery");
+  await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
+  // Re-propose during the recovery freeze; even cold custody must wait a fresh day.
+  await f.exit.call(f.guard, "propose_cold_key_guardian_change", args);
+  const pending = await f.guard.view("get_pending_guardian_change");
+  assert.ok(BigInt(pending.activate_after) > BigInt(first.activate_after));
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /proposal_id_mismatch/);
+  await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /cold_key_guardian_change_pending/);
+  await waitUntil(pending.activate_after);
+  await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /cold_key_guardian_change_pending/);
+  await f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: recovery.proposal_id });
+  assert.deepEqual(await f.guard.view("get_pending_guardian_change"), pending);
+  await assert.rejects(f.stranger.call(f.guard, "propose_guardian_change", args), /cold_key_guardian_change_pending/);
+  await f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: pending.proposal_id });
+  const config = await f.guard.view("get_config");
+  assert.equal(config.guardian_id, next.accountId);
+  assert.equal(config.exit_id, f.exit.accountId);
+  for (const [method, input, error] of [
+    ["cancel_guardian_change", {}, /guardian_only/],
+    ["propose_owner_recovery", { owner_id: f.owner.accountId }, /guardian_only/],
+    ["cancel_policy", {}, /owner_or_guardian_only/],
+    ["emergency_sweep", { token_id: f.token.accountId }, /owner_or_guardian_only/],
+  ]) await assert.rejects(f.guardian.call(f.guard, method, input, { gas: 200_000_000_000_000n }), error);
+  await next.call(f.guard, "cancel_policy", {});
+  assert.equal((await f.spending({ day: spent.day })).spent, spent.spent);
+  await assert.rejects(f.pay({ ...f.payment, request_id: "cold-ledger" }), /duplicate_request/);
+  assert.deepEqual((await f.guard.viewAccessKeys(f.guard.accountId)).keys, []);
+});
