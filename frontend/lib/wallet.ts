@@ -10,7 +10,8 @@ export type WriteCall =
   | { method: "cancel_policy"; args: Record<string, never> }
   | { method: "disable_policy"; args: { token_id: string } }
   | { method: "propose_guardian_change"; args: { guardian_id: string } }
-  | { method: "cancel_guardian_change"; args: Record<string, never> }
+  | { method: "propose_cold_key_guardian_change"; args: { guardian_id: string } } // exit_id only (#12)
+  | { method: "cancel_guardian_change"; args: Record<string, never> } // owner vetoes cold-key proposals (#13)
   | { method: "activate_guardian_change"; args: { proposal_id: string } }
   | { method: "propose_owner_recovery"; args: { owner_id: string } }
   | { method: "cancel_owner_recovery"; args: Record<string, never> }
@@ -20,7 +21,7 @@ export type WriteCall =
 export const WALLET_WIRED = false;
 
 export async function signAndSend(call: WriteCall): Promise<{ simulated: true; call: WriteCall }> {
-  // TODO(contract author): selector.wallet().signAndSendTransaction({ receiverId: CONTRACT,
+  // TODO(contract author): selector.wallet().signAndSendTransaction({ receiverId: GUARD_CONTRACT_ID (lib/guard.ts),
   //   actions: [{ type: "FunctionCall", params: { methodName: call.method, args: call.args,
   //   gas: emergency_sweep ? "200000000000000" : "30000000000000", deposit: "0" } }] })
   // Note: emergency_sweep requires 180-250 Tgas prepaid (beginSweep check).
