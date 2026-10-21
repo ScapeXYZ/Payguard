@@ -47,8 +47,8 @@ are also covered by the fast deterministic tests.
 
 ## Contract API and accounting
 
-- `init({owner_id, agent_id, guardian_id})`: once only; predecessor must equal owner. Owner,
-  agent, guardian, and guard must be separate accounts. Create/deploy/initialize together
+- `init({owner_id, agent_id, guardian_id, exit_id})`: once only; predecessor must equal owner. Owner,
+  agent, guardian, guard and exit must be separate accounts. Create/deploy/initialize together
   as described below to prevent an initialization takeover.
 - `set_policy({token_id, max_per_payment, daily_limit, recipients})`: owner-only,
   zero deposit. Submits a full token policy under the timelock lifecycle below.
@@ -132,7 +132,7 @@ policy/spending storage remains readable, but legacy payments made without IDs
 cannot be deduplicated retrospectively. The test helper creates fresh IDs for
 distinct test payments; production retry logic must retain its original ID.
 
-The contract schedules only `ft_transfer` on the configured token contract, with
+Ordinary `pay` schedules only `ft_transfer` on the configured token contract, with
 the validated recipient/amount, 30 Tgas and 1 yoctoNEAR from the guard. It exposes
 no raw-call, native withdrawal, spending reset, refund, or key-management method.
 It accepts ordinary incoming `ft_transfer` deposits after token registration;
@@ -153,7 +153,7 @@ mean the guard reservation rolled back. Same-ID retries reject without paying
 again; a deliberately new ID reserves again. The agent can exhaust its
 daily budget with failed transfers and must wait until a new UTC day (or a
 trusted owner deliberately changes policy). This conservative accounting also
-handles a missing/failed callback because no callback exists.
+handles a missing/failed payment callback because payments have no callback.
 
 ## Testnet deployment outline and keys
 
@@ -164,7 +164,7 @@ testnet accounts and valueless test tokens; no mainnet deployment is included.
    with the trusted operator until their on-chain retirement. In **one transaction action batch signed by owner**,
    receiver a new child guard account: create account, fund storage,
    add a temporary operator-only full-access key, deploy `build/guard.wasm`, and call `init`
-   with `{owner_id, agent_id, guardian_id}` and zero deposit. The Sandbox fixture demonstrates
+   with `{owner_id, agent_id, guardian_id, exit_id}` and zero deposit. The Sandbox fixture demonstrates
    this sequence. Do not deploy uninitialized code publicly: an attacker could
    claim it by naming themselves owner. A separate owner cannot deploy arbitrary
    code onto an existing account; the creation batch establishes this authority.
@@ -250,7 +250,7 @@ findings, all twelve high-severity dependency entries and their reachability.
 
 ## Guardian and owner recovery lifecycle
 
-New deployments require `guardian_id` in `init` and return it in `get_config`.
+New deployments require `guardian_id` and `exit_id` in `init` and return both in `get_config`.
 Owner, agent, guardian and guard must all be distinct. Configuration is persistent
 SDK-managed on-chain state; authorization always uses NEAR predecessor, never
 signer or a supplied identity. This initialization API is incompatible with older
@@ -337,3 +337,56 @@ assets, restore guard access keys or replenish the restricted agent's allowance.
 A compromised current owner can veto guardian recovery repeatedly; this veto
 protects a responsive legitimate owner but cannot distinguish compromise from
 legitimate control. The old owner can also tighten/disable during the recovery window. Ordinary allowed payments remain exposed during that window.
+
+## Emergency cold exit (PR #10)
+
+New deployments use `init({owner_id, agent_id, guardian_id, exit_id})` and expose
+all four IDs through `get_config()`. `exit_id` must already be a canonical lowercase
+NEAR account ID, separate from guard, owner, agent and guardian. It is permanent:
+there is no setter, migration or upgrade method. Recovery and guardian rotation
+cannot change it or adopt it as a replacement identity.
+
+Current owner or current guardian can call `emergency_sweep({token_id})`, with
+zero deposit and 180–250 Tgas (recommended 200 Tgas). Authentication uses
+`predecessor_account_id`. No destination or amount is accepted; extra JSON fields
+cannot override the stored exit. Policy caps, daily limits, allowlists, disabled
+policies, pending recovery and guardian replacement do not restrict this exit.
+Spending and payment request records remain intact. Former identities cannot
+initiate sweeps after rotation; already authorized receipts can still complete.
+
+This sweeps **one NEP-141 token contract per call**, including tokens with no
+payment policy. Operators discover token contract IDs from funding records or an
+external indexer; there is no on-chain enumeration of every asset held by a NEAR
+account. The guard queries that token's `ft_balance_of({account_id: guard})` with
+30 Tgas, then transfers the entire reported u128 balance to `exit_id` via
+`ft_transfer` (30 Tgas, exactly 1 yoctoNEAR from guard). It does not sweep native
+NEAR, NFTs, locked balances, or funds arriving after the balance snapshot.
+Register **both guard and exit on each token**, using that token's
+`storage_deposit`, before funding. The sweep does not auto-register or redirect:
+a compliant token rejects an unregistered exit safely, leaving tokens in guard.
+This follows [NEP-141](https://github.com/near/NEPs/blob/master/neps/nep-0141.md)
+and [NEP-145](https://github.com/near/NEPs/blob/master/neps/nep-0145.md).
+
+The returned promise resolves to `transferred`, `zero_balance`,
+`balance_query_failed`, or `transfer_failed`. The last two are failure statuses,
+**even when the outer transaction succeeds**: inspect the returned value and
+final token balances. Zero balance makes no transfer. Failed queries (including
+malformed/non-u128 responses) and failed transfers release the per-token lock,
+allowing a fresh authorized attempt. Each attempt has a persistent monotonic ID;
+private `on_sweep_balance` and `on_sweep_transfer` callbacks check the active ID.
+Concurrent same-token sweeps reject with `sweep_pending`; different tokens are
+independent. New same-token payments also reject while locked. Previously queued
+payments can race the snapshot and cause a transfer failure; retry after their
+settlement. New deposits can require another sweep. Repeating a completed sweep
+queries the current balance rather than replaying an old amount.
+
+Callbacks reserve 120 Tgas for balance resolution and 30 Tgas for settlement.
+Guard needs native NEAR for storage and outgoing deposits. A callback panic,
+resource exhaustion or protocol failure can leave its token lock stuck; there is
+intentionally no unsafe timeout unlock or administrative reset. Such a failure
+may permanently prevent that token's payments and sweeps on a keyless guard.
+Token code and these fixed gas budgets remain trust/availability boundaries;
+a malicious or upgraded token can lie about balances or success, stall, or reject.
+A compromised owner **or guardian** can force immediate evacuation to the cold
+account, so cold custody must be independent, usable and monitored. Loss or
+compromise of that immutable destination cannot be repaired by rotation.

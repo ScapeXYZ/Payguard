@@ -4,7 +4,7 @@ import {
   activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
   getRecoveryCooldown, proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
   proposeGuardianChange, cancelGuardianChange, activateGuardianChange, getPendingGuardianChange,
-  type Host, type Payment,
+  beginSweep, checkSweep, finishSweep, amount, type Host, type Payment,
 } from "./policy";
 
 const host: Host = {
@@ -22,13 +22,15 @@ class PayGuard {
   owner_id = "";
   agent_id = "";
   guardian_id = "";
+  exit_id = "";
 
   @initialize({})
-  init({ owner_id, agent_id, guardian_id }: { owner_id: string; agent_id: string; guardian_id: string }): void {
-    const config = initializeConfig(host, owner_id, agent_id, guardian_id);
+  init({ owner_id, agent_id, guardian_id, exit_id }: { owner_id: string; agent_id: string; guardian_id: string; exit_id: string }): void {
+    const config = initializeConfig(host, owner_id, agent_id, guardian_id, exit_id);
     this.owner_id = config.owner_id;
     this.agent_id = config.agent_id;
     this.guardian_id = config.guardian_id;
+    this.exit_id = config.exit_id;
   }
 
   @call({})
@@ -85,9 +87,50 @@ class PayGuard {
     }), 1n, TRANSFER_GAS);
   }
 
+  @call({})
+  emergency_sweep({ token_id }: { token_id: string }): NearPromise {
+    const pending = beginSweep(host, this, token_id);
+    return NearPromise.new(pending.token_id).functionCall("ft_balance_of",
+      JSON.stringify({ account_id: near.currentAccountId() }), 0n, 30_000_000_000_000n)
+      .then(NearPromise.new(near.currentAccountId()).functionCall("on_sweep_balance",
+        JSON.stringify(pending), 0n, 120_000_000_000_000n));
+  }
+
+  @call({ privateFunction: true })
+  on_sweep_balance({ token_id, sweep_id }: { token_id: string; sweep_id: string }): NearPromise | string {
+    checkSweep(host, token_id, sweep_id);
+    let balance: string;
+    try {
+      const result = JSON.parse(near.promiseResult(0));
+      balance = result === "0" ? "0" : amount(result).toString();
+    } catch (_) {
+      finishSweep(host, token_id, sweep_id);
+      return "balance_query_failed";
+    }
+    if (balance === "0") {
+      finishSweep(host, token_id, sweep_id);
+      return "zero_balance";
+    }
+    // Registration is enforced by ft_transfer itself. Never auto-register or
+    // select a fallback recipient on failure.
+    return NearPromise.new(token_id).functionCall("ft_transfer", JSON.stringify({
+      receiver_id: this.exit_id, amount: balance,
+    }), 1n, TRANSFER_GAS).then(NearPromise.new(near.currentAccountId()).functionCall(
+      "on_sweep_transfer", JSON.stringify({ token_id, sweep_id }), 0n, 30_000_000_000_000n));
+  }
+
+  @call({ privateFunction: true })
+  on_sweep_transfer({ token_id, sweep_id }: { token_id: string; sweep_id: string }): string {
+    checkSweep(host, token_id, sweep_id);
+    let status = "transferred";
+    try { near.promiseResult(0); } catch (_) { status = "transfer_failed"; }
+    finishSweep(host, token_id, sweep_id);
+    return status;
+  }
+
   @view({})
-  get_config(): { owner_id: string; agent_id: string; guardian_id: string } {
-    return { owner_id: this.owner_id, agent_id: this.agent_id, guardian_id: this.guardian_id };
+  get_config(): { owner_id: string; agent_id: string; guardian_id: string; exit_id: string } {
+    return { owner_id: this.owner_id, agent_id: this.agent_id, guardian_id: this.guardian_id, exit_id: this.exit_id };
   }
 
   @view({})

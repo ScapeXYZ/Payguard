@@ -38,6 +38,7 @@ async function fixture(t) {
   const worker = await Worker.init({ network: "sandbox" });
   t.after(() => worker.tearDown());
   const owner = await worker.rootAccount.createSubAccount("owner", { initialBalance: 100n * 10n ** 24n });
+  const exit = await worker.rootAccount.createSubAccount("cold");
   const guardian = await worker.rootAccount.createSubAccount("guardian");
   const agent = await owner.createSubAccount("agent", { initialBalance: 5n * 10n ** 24n });
   const alice = await owner.createSubAccount("alice", { initialBalance: 10n ** 24n });
@@ -55,12 +56,12 @@ async function fixture(t) {
     .addKey(backup.getPublicKey(), transactions.fullAccessKey())
     .addKey(guardFunctionKey.getPublicKey(), transactions.functionCallAccessKey(guard.accountId, ["pay"], 10n ** 24n))
     .deployContract(await readFile("build/guard.wasm"))
-    .functionCall("init", { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId }, { gas: 30_000_000_000_000n })
+    .functionCall("init", { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId, exit_id: exit.accountId }, { gas: 30_000_000_000_000n })
     .transact();
   assert.equal(deployment.failed, false);
   await token.deploy("build/mock-ft.wasm");
   await owner.call(token, "init", { owner_id: owner.accountId, total_supply: "1000000000" });
-  for (const account of [guard, alice]) {
+  for (const account of [guard, alice, exit]) {
     await owner.call(token, "storage_deposit", { account_id: account.accountId }, { attachedDeposit: 10n ** 22n });
   }
   await owner.call(token, "ft_transfer", { receiver_id: guard.accountId, amount: "500000000" }, { attachedDeposit: 1n });
@@ -89,6 +90,7 @@ async function fixture(t) {
   }, { gas: 80_000_000_000_000n, attachedDeposit: 1n }), /not payable/i);
   await assert.rejects(agent.call(guard, "set_policy", policy), /owner_only/);
   await assert.rejects(agent.call(guard, "cancel_owner_recovery", {}), /owner_only/);
+  await assert.rejects(agent.call(guard, "emergency_sweep", { token_id: token.accountId }, { gas: 200_000_000_000_000n }), /owner_or_guardian_only/);
   const agentSetupKey = await agent.getKey();
   const retired = await agent.batch(agent).deleteKey(agentSetupKey.getPublicKey()).transact();
   assert.equal(retired.failed, false);
@@ -117,11 +119,11 @@ async function fixture(t) {
   assert.equal((await guard.view("get_policy", { token_id: token.accountId })).max_per_payment, "45000000");
   await owner.call(guard, "set_policy", policy);
   await activatePending(worker, stranger, guard);
-  assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId });
+  assert.deepEqual(await guard.view("get_config"), { owner_id: owner.accountId, agent_id: agent.accountId, guardian_id: guardian.accountId, exit_id: exit.accountId });
   const payment = { token_id: token.accountId, recipient_id: alice.accountId, amount: "40000000" };
   const options = { gas: 80_000_000_000_000n, attachedDeposit: 0n, signWithKey: restricted };
   let sequence = 0;
-  return { worker, owner, guardian, agent, alice, stranger, guard, token, policy, payment, options,
+  return { worker, owner, exit, guardian, agent, alice, stranger, guard, token, policy, payment, options,
     pay: (input = payment) => agent.call(guard, "pay", { request_id: "sandbox-" + ++sequence, ...input }, options),
     spending: (args = {}) => guard.view("get_spending", { token_id: token.accountId, ...args }),
     balance: (account) => token.view("ft_balance_of", { account_id: account.accountId }),
@@ -322,6 +324,9 @@ test("Sandbox: guardian veto and delayed owner recovery preserve keyless payment
   await assert.rejects(f.pay(), /daily_limit/);
   assert.deepEqual((await f.guard.viewAccessKeys(f.guard.accountId)).keys, []);
   await assert.rejects(f.agent.call(f.guard, "propose_owner_recovery", { owner_id: f.owner.accountId }, f.options), { type: "MethodNameMismatch" });
+  await assert.rejects(f.owner.call(f.guard, "emergency_sweep", { token_id: f.token.accountId }, { gas: 200_000_000_000_000n }), /owner_or_guardian_only/);
+  assert.equal(await f.stranger.call(f.guard, "emergency_sweep", { token_id: f.token.accountId }, { gas: 200_000_000_000_000n }), "transferred");
+  assert.equal((await f.guard.view("get_config")).exit_id, f.exit.accountId);
 });
 
 test("Sandbox: unvetoed owner replacement despite recovery invalidates queued takeover", { timeout: 600000 }, async (t) => {
@@ -361,6 +366,9 @@ test("Sandbox: unvetoed owner replacement despite recovery invalidates queued ta
   for (const old of [recovery, latest]) await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: old.proposal_id }), /no_pending_identity/);
   await next.call(f.guard, "cancel_policy", {});
   await next.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  await assert.rejects(f.guardian.call(f.guard, "emergency_sweep", { token_id: f.token.accountId }, { gas: 200_000_000_000_000n }), /owner_or_guardian_only/);
+  assert.equal(await next.call(f.guard, "emergency_sweep", { token_id: f.token.accountId }, { gas: 200_000_000_000_000n }), "transferred");
+  assert.equal((await f.guard.view("get_config")).exit_id, f.exit.accountId);
 });
 
 test("Sandbox: current guardian veto uses predecessor and preserves recovery, ledger and full replacement delay", { timeout: 600000 }, async (t) => {
@@ -419,4 +427,55 @@ test("Sandbox: current guardian veto uses predecessor and preserves recovery, le
   await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /guardian_only/);
   await next.call(f.guard, "cancel_guardian_change", {});
   assert.equal(await f.guard.view("get_pending_guardian_change"), null);
+});
+
+test("Sandbox: cold exit sweeps full balances, fails safely and serializes receipts", { timeout: 600000 }, async (t) => {
+  const f = await fixture(t);
+  const args = { token_id: f.token.accountId, receiver_id: f.stranger.accountId, exit_id: f.stranger.accountId };
+  const opts = { gas: 200_000_000_000_000n };
+  await assert.rejects(f.owner.call(f.guard, "init", { owner_id: f.owner.accountId, agent_id: f.agent.accountId, guardian_id: f.guardian.accountId, exit_id: f.stranger.accountId }), /already initialized/i);
+  for (const caller of [f.stranger]) {
+    await assert.rejects(caller.call(f.guard, "emergency_sweep", args, opts), /owner_or_guardian_only/);
+  }
+  await assert.rejects(f.agent.call(f.guard, "emergency_sweep", args, f.options), { type: "MethodNameMismatch" });
+  await assert.rejects(f.owner.call(f.token, "forward_identity", {
+    guard_id: f.guard.accountId, method: "emergency_sweep", args,
+  }, { gas: 250_000_000_000_000n }), /owner_or_guardian_only/);
+  await assert.rejects(f.owner.call(f.guard, "on_sweep_balance", { token_id: f.token.accountId, sweep_id: "1" }), /private/i);
+  await assert.rejects(f.owner.call(f.guard, "emergency_sweep", args, { ...opts, attachedDeposit: 1n }), /not payable/i);
+  await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
+  await f.owner.call(f.guard, "propose_guardian_change", { guardian_id: f.alice.accountId });
+  await f.owner.call(f.guard, "disable_policy", { token_id: f.token.accountId });
+  const spending = await f.spending();
+  const concurrent = await Promise.allSettled([
+    f.owner.call(f.guard, "emergency_sweep", args, opts),
+    f.guardian.call(f.guard, "emergency_sweep", args, opts),
+  ]);
+  assert.ok(concurrent.some(r => r.status === "fulfilled" && r.value === "transferred"));
+  for (const result of concurrent) {
+    if (result.status === "rejected") assert.match(String(result.reason), /sweep_pending/);
+    else assert.ok(["transferred", "zero_balance"].includes(result.value));
+  }
+  assert.equal(await f.balance(f.guard), "0");
+  assert.equal(await f.balance(f.exit), "500000000");
+  assert.equal(await f.balance(f.stranger), "0");
+  assert.deepEqual(await f.spending(), spending);
+  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", args, opts), "zero_balance");
+  // Another token has no policy and exit is initially unregistered.
+  // Avoid the default 100 NEAR transfer from the already-funded fixture owner.
+  // Match the primary token's 10 NEAR budget for contract storage and gas.
+  const other = await f.owner.createSubAccount("other", { initialBalance: 10n * 10n ** 24n });
+  await other.deploy("build/mock-ft.wasm");
+  await f.owner.call(other, "init", { owner_id: f.owner.accountId, total_supply: "123" });
+  await f.owner.call(other, "storage_deposit", { account_id: f.guard.accountId });
+  await f.owner.call(other, "ft_transfer", { receiver_id: f.guard.accountId, amount: "123" }, { attachedDeposit: 1n });
+  const second = { token_id: other.accountId };
+  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", second, opts), "transfer_failed");
+  assert.equal(await other.view("ft_balance_of", { account_id: f.guard.accountId }), "123");
+  await f.owner.call(other, "storage_deposit", { account_id: f.exit.accountId });
+  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", second, opts), "transferred");
+  assert.equal(await other.view("ft_balance_of", { account_id: f.exit.accountId }), "123");
+  // Missing ft_balance_of gives a recoverable query failure on every retry.
+  for (let i = 0; i < 2; i++) assert.equal(await f.owner.call(f.guard, "emergency_sweep", { token_id: f.stranger.accountId }, opts), "balance_query_failed");
+  assert.equal((await f.guard.view("get_config")).exit_id, f.exit.accountId);
 });

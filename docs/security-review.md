@@ -103,8 +103,7 @@ input. Unit and Sandbox regressions reject final-newline variants.
 Failed asynchronous `ft_transfer` calls keep their budget reservation **and**
 request marker. This prevents unsafe budget reopening/retry double payment but
 lets the configured agent exhaust its own daily budget with failed transfers.
-There is no refund/reconciliation callback, no status callback, and no callback
-surface to spoof. A failed later receipt does not roll back the guard's earlier
+Ordinary payments have no refund/reconciliation or status callback. A failed later receipt does not roll back the guard's earlier
 committed receipt. NEAR deposit refunds are not budget refunds.
 
 An uninitialized public deployment can be claimed by a caller naming itself
@@ -114,8 +113,7 @@ configuration remains trusted. Guard full-access signing keys are trusted only
 during setup; the required post-initialization lock removes every guard key.
 Approved token code can lie or be upgraded; syntax validation is not token-code
 verification. Recipients can forward tokens after receipt. Historical spending
-and request markers require storage; the contract has no cleanup or emergency
-withdrawal method. UTC calendar days allow spending on both sides of midnight,
+and request markers require storage; the contract has no cleanup method; emergency FT exit is described below. UTC calendar days allow spending on both sides of midnight,
 not a rolling 24-hour cap.
 Policy changes cannot cancel already scheduled promises. Reservations belong to
 their authorization day; transfers authorized before midnight may settle after
@@ -207,7 +205,7 @@ a stranger and verify actual FT balances using the restricted agent after expiry
   `activate_policy`, `cancel_policy`, `disable_policy`, `propose_owner_recovery`,
   `get_pending_owner_recovery`, `cancel_owner_recovery`, `activate_owner_recovery`, `propose_guardian_change`,
   `get_pending_guardian_change`, `cancel_guardian_change`, `activate_guardian_change`, `get_recovery_cooldown`. The views do not write state or
-  schedule calls. No raw transfer, arbitrary call, reset or callback is exported.
+  schedule calls. No arbitrary call or reset is exported; private sweep callbacks are described below.
   The agent key permits only `pay`; even a key configuration mistake would still
   face contract ACLs. The zero-key guard has no account-key escape or self-upgrade method.
 
@@ -228,7 +226,7 @@ SDK's on-chain key lookup. Owner policy changes and restricted-agent payments
 run after locking, including the separate 40 + 40 + rejected 40 scenario.
 
 The current contract exposes no upgrade or key installation path, so
-this lock is irreversible. The owner retains policy administration only. The
+this lock is irreversible. The owner retains policy administration and fixed-destination emergency exit authority. The
 agent's removal of full-access authority also prevents key rotation and finite
 allowance replenishment. See [the operational runbook](key-management.md) for
 explicit real-network confirmation and migration/recovery limitations.
@@ -285,7 +283,7 @@ relay whose predecessor is the mock FT.
 
 ## Guardian and owner recovery lifecycle
 
-New deployments require `guardian_id` in `init` and return it in `get_config`.
+New deployments require `guardian_id` and `exit_id` in `init` and return both in `get_config`.
 Owner, agent, guardian and guard must all be distinct. Configuration is persistent
 SDK-managed on-chain state; authorization always uses NEAR predecessor, never
 signer or a supplied identity. This initialization API is incompatible with older
@@ -372,3 +370,41 @@ assets, restore guard access keys or replenish the restricted agent's allowance.
 A compromised current owner can veto guardian recovery repeatedly; this veto
 protects a responsive legitimate owner but cannot distinguish compromise from
 legitimate control. The old owner can also tighten/disable during the recovery window. Ordinary allowed payments remain exposed during that window.
+
+## PR #10: emergency cold exit review (2026-10-21)
+
+The initialization trust boundary now includes immutable `exit_id`. Validation
+requires exact canonical lowercase syntax and separation from all four existing
+accounts. Both proposal and activation identity checks also exclude exit, so
+rotation cannot collapse custody roles. Only init writes exit; export checks
+include no setter or upgrade path. SDK initialization remains once-only.
+
+`emergency_sweep({token_id})` authenticates current owner/current guardian by
+predecessor, requires zero deposit and 180–250 Tgas, and makes no policy lookup.
+It queries `ft_balance_of` on one validated, non-self token and never takes a
+caller-selected destination or amount. Balance parsing accepts only canonical
+u128 strings (including zero). No spending or replay records are reset. Token
+registration is enforced by the token's `ft_transfer`: failure is reported and
+never redirects assets. No automatic storage spending is authorized.
+
+The new private exported callbacks are `on_sweep_balance` and
+`on_sweep_transfer`. They require self-predecessor and the active monotonic sweep
+ID; external owner, guardian, token and signer relays cannot invoke them. A
+per-token lock spans query through transfer completion, rejects concurrent sweeps
+and new ordinary same-token payments, and never uses an unsafe timeout unlock.
+Different token locks are independent. Successful zero-balance/query-failure/
+transfer-failure resolution releases only that token lock; prior payment ledger,
+request markers and policy/identity state are retained. Callback success carries
+an explicit status, not necessarily a successful token transfer.
+
+Accepted risks: earlier payment receipts can change the balance after discovery;
+funds arriving later require another call. A callback failure outside handled
+promise-result errors can strand the lock permanently. Insufficient native funds,
+storage or gas can prevent exit. Fixed gas must be checked against each actual
+token; malicious/upgraded token code can lie, consume gas or refuse transfers.
+There is no asset registry, multi-token atomicity, native withdrawal or universal
+asset evacuation. Current owner or guardian compromise permits immediate forced
+cold evacuation; independent exit custody is essential. Immutable cold account
+loss/compromise is unrecoverable. Rotation revokes new sweep initiation, but
+cannot revoke already scheduled authorization. Existing dependency findings and
+unaudited status remain applicable.
