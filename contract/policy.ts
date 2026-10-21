@@ -187,7 +187,7 @@ export const RECOVERY_COOLDOWN_NS = DAY_NS; // Fixed 24 hours after an owner vet
 export function getRecoveryCooldown(host: Host): string {
   return host.read("recovery_cooldown_until") ?? "0";
 }
-export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string; owner_proposed?: boolean };
+export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string; owner_proposed?: boolean; cold_key_proposed?: boolean };
 export function getPendingOwnerRecovery(host: Host): PendingIdentity | null {
   return JSON.parse(host.read("pending_owner_recovery") ?? "null");
 }
@@ -201,6 +201,7 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
     requireThat(host.timestamp() >= BigInt(getRecoveryCooldown(host)), "recovery_cooldown");
   } else {
     requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
+    requireThat(!getPendingGuardianChange(host)?.cold_key_proposed, "cold_key_guardian_change_pending");
     if (host.predecessor() !== config.owner_id) {
       requireThat(!getPendingGuardianChange(host)?.owner_proposed, "owner_guardian_change_pending");
       requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
@@ -216,7 +217,7 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
   }));
   if (recovery) {
     host.write("pending_policy", "null");
-    if (!getPendingGuardianChange(host)?.owner_proposed) host.write("pending_guardian_change", "null");
+    if (!getPendingGuardianChange(host)?.owner_proposed && !getPendingGuardianChange(host)?.cold_key_proposed) host.write("pending_guardian_change", "null");
   }
 }
 export function proposeOwnerRecovery(host: Host, config: Config, replacement: unknown): void {
@@ -235,11 +236,23 @@ export function cancelOwnerRecovery(host: Host, config: Config): void {
 export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
   proposeIdentity(host, config, replacement, false);
 }
-// Immediate veto by the active guardian, including owner proposals and mature changes.
+// Immutable cold custody can supersede any proposal, always with a fresh full delay.
+export function proposeColdKeyGuardianChange(host: Host, config: Config, replacement: unknown): void {
+  zeroDeposit(host);
+  requireThat(host.predecessor() === config.exit_id, "exit_only");
+  const account_id = accountId(replacement);
+  requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
+  const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
+  host.write("identity_sequence", proposal_id);
+  host.write("pending_guardian_change", JSON.stringify({ proposal_id, account_id,
+    activate_after: (host.timestamp() + RECOVERY_DELAY_NS).toString(), cold_key_proposed: true }));
+}
+// Immediate veto of ordinary changes, including owner proposals and mature changes.
 // Preserve sequence, recovery, cooldown and payment state; canceled IDs stay invalid.
 export function cancelGuardianChange(host: Host, config: Config): void {
   zeroDeposit(host);
   requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+  requireThat(!getPendingGuardianChange(host)?.cold_key_proposed, "cold_key_guardian_change_pending");
   host.write("pending_guardian_change", "null");
 }
 function activateIdentity(host: Host, config: Config, proposalId: unknown, recovery: boolean): void {
@@ -250,9 +263,12 @@ function activateIdentity(host: Host, config: Config, proposalId: unknown, recov
   requireThat(host.timestamp() >= BigInt(pending.activate_after), "identity_timelocked");
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
   if (recovery) {
+    const guardianChange = getPendingGuardianChange(host);
+    // Recovery cannot erase cold custody's proposal or occupy its replacement account.
+    requireThat(!guardianChange?.cold_key_proposed || guardianChange.account_id !== pending.account_id,
+      "separate_replacement_required");
     config.owner_id = pending.account_id;
-    // The former owner's pending administration cannot survive ownership recovery.
-    host.write("pending_guardian_change", "null");
+    if (!guardianChange?.cold_key_proposed) host.write("pending_guardian_change", "null");
   } else {
     config.guardian_id = pending.account_id;
     // Displaced guardian authority must not survive in a queued recovery.
