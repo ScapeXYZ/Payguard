@@ -39,6 +39,7 @@ export type TokenPolicy = {
   recipients: string[];
 };
 export type Host = {
+  log(message: string): void;
   predecessor(): string;
   currentAccount(): string;
   attachedDeposit(): bigint;
@@ -47,6 +48,11 @@ export type Host = {
   read(key: string): string | null;
   write(key: string, value: string): void;
 };
+// NEP-297 envelope; integer timestamps, IDs and amounts remain decimal strings.
+export function emitEvent(host: Host, event: string, data: Record<string, unknown>): void {
+  host.log("EVENT_JSON:" + JSON.stringify({ standard: "payguard", version: "1.0.0", event,
+    data: [{ ...data, actor_id: host.predecessor(), timestamp_ns: host.timestamp().toString() }] }));
+}
 export type Config = { owner_id: string; agent_id: string; guardian_id: string; readonly exit_id: string };
 export type Payment = { request_id: string; token_id: string; recipient_id: string; amount: string };
 
@@ -198,6 +204,7 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
   zeroDeposit(host);
   if (recovery) {
     requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+    requireThat(!getPendingGuardianChange(host)?.cold_key_proposed, "cold_key_guardian_change_pending");
     requireThat(host.timestamp() >= BigInt(getRecoveryCooldown(host)), "recovery_cooldown");
   } else {
     requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
@@ -209,12 +216,18 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
   }
   const account_id = accountId(replacement);
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
+  const superseded = recovery ? getPendingOwnerRecovery(host) : getPendingGuardianChange(host);
   const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
   host.write("identity_sequence", proposal_id);
   host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", JSON.stringify({
     proposal_id, account_id, activate_after: (host.timestamp() + RECOVERY_DELAY_NS).toString(),
     ...(!recovery ? { owner_proposed: host.predecessor() === config.owner_id } : {}),
   }));
+  emitEvent(host, recovery ? "owner_recovery_proposed" : "guardian_change_proposed", {
+    ...JSON.parse(host.read(recovery ? "pending_owner_recovery" : "pending_guardian_change")!),
+    previous_account_id: recovery ? config.owner_id : config.guardian_id,
+    superseded_proposal_id: superseded?.proposal_id ?? null,
+  });
   if (recovery) {
     host.write("pending_policy", "null");
     if (!getPendingGuardianChange(host)?.owner_proposed && !getPendingGuardianChange(host)?.cold_key_proposed) host.write("pending_guardian_change", "null");
@@ -228,9 +241,13 @@ export function proposeOwnerRecovery(host: Host, config: Config, replacement: un
 export function cancelOwnerRecovery(host: Host, config: Config): void {
   zeroDeposit(host);
   requireThat(host.predecessor() === config.owner_id, "owner_only");
-  if (getPendingOwnerRecovery(host) !== null) {
+  const pending = getPendingOwnerRecovery(host);
+  if (pending !== null) {
     host.write("recovery_cooldown_until", (host.timestamp() + RECOVERY_COOLDOWN_NS).toString());
     host.write("pending_owner_recovery", "null");
+    emitEvent(host, "owner_recovery_vetoed", { ...pending });
+    emitEvent(host, "recovery_cooldown_started", { proposal_id: pending.proposal_id,
+      cooldown_until: getRecoveryCooldown(host) });
   }
 }
 export function proposeGuardianChange(host: Host, config: Config, replacement: unknown): void {
@@ -242,39 +259,48 @@ export function proposeColdKeyGuardianChange(host: Host, config: Config, replace
   requireThat(host.predecessor() === config.exit_id, "exit_only");
   const account_id = accountId(replacement);
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(account_id), "separate_replacement_required");
+  const superseded = getPendingGuardianChange(host);
   const proposal_id = (BigInt(host.read("identity_sequence") ?? "0") + 1n).toString();
   host.write("identity_sequence", proposal_id);
   host.write("pending_guardian_change", JSON.stringify({ proposal_id, account_id,
     activate_after: (host.timestamp() + RECOVERY_DELAY_NS).toString(), cold_key_proposed: true }));
+  emitEvent(host, "guardian_change_proposed", { ...getPendingGuardianChange(host),
+    previous_account_id: config.guardian_id, superseded_proposal_id: superseded?.proposal_id ?? null });
 }
-// Immediate veto of ordinary changes, including owner proposals and mature changes.
-// Preserve sequence, recovery, cooldown and payment state; canceled IDs stay invalid.
+// Owner alone vetoes cold proposals; ordinary changes retain guardian-only veto.
 export function cancelGuardianChange(host: Host, config: Config): void {
   zeroDeposit(host);
-  requireThat(host.predecessor() === config.guardian_id, "guardian_only");
-  requireThat(!getPendingGuardianChange(host)?.cold_key_proposed, "cold_key_guardian_change_pending");
+  const pending = getPendingGuardianChange(host);
+  if (pending?.cold_key_proposed) {
+    requireThat(host.predecessor() !== config.guardian_id, "cold_key_guardian_change_pending");
+    requireThat(host.predecessor() === config.owner_id, "owner_only");
+  } else {
+    requireThat(host.predecessor() === config.guardian_id, "guardian_only");
+  }
   host.write("pending_guardian_change", "null");
+  if (pending) emitEvent(host, "guardian_change_vetoed", { ...pending });
 }
 function activateIdentity(host: Host, config: Config, proposalId: unknown, recovery: boolean): void {
   zeroDeposit(host);
+  if (recovery) requireThat(!getPendingGuardianChange(host)?.cold_key_proposed, "cold_key_guardian_change_pending");
   const pending = recovery ? getPendingOwnerRecovery(host) : getPendingGuardianChange(host);
+  const previous_account_id = recovery ? config.owner_id : config.guardian_id;
+  const cleared = recovery ? getPendingGuardianChange(host) : getPendingOwnerRecovery(host);
   requireThat(pending !== null, "no_pending_identity");
   requireThat(pending.proposal_id === proposalId, "proposal_id_mismatch");
   requireThat(host.timestamp() >= BigInt(pending.activate_after), "identity_timelocked");
   requireThat(![config.owner_id, config.agent_id, config.guardian_id, config.exit_id, host.currentAccount()].includes(pending.account_id), "separate_replacement_required");
   if (recovery) {
-    const guardianChange = getPendingGuardianChange(host);
-    // Recovery cannot erase cold custody's proposal or occupy its replacement account.
-    requireThat(!guardianChange?.cold_key_proposed || guardianChange.account_id !== pending.account_id,
-      "separate_replacement_required");
     config.owner_id = pending.account_id;
-    if (!guardianChange?.cold_key_proposed) host.write("pending_guardian_change", "null");
+    host.write("pending_guardian_change", "null");
   } else {
     config.guardian_id = pending.account_id;
     // Displaced guardian authority must not survive in a queued recovery.
     host.write("pending_owner_recovery", "null");
   }
   host.write(recovery ? "pending_owner_recovery" : "pending_guardian_change", "null");
+  emitEvent(host, recovery ? "owner_recovery_activated" : "guardian_change_activated", {
+    ...pending, previous_account_id, cleared_proposal_id: cleared?.proposal_id ?? null });
 }
 export function activateOwnerRecovery(host: Host, config: Config, proposalId: unknown): void {
   activateIdentity(host, config, proposalId, true);
@@ -294,6 +320,7 @@ export function beginSweep(host: Host, config: Config, token: unknown): { token_
   const sweep_id = (BigInt(host.read("sweep_sequence") ?? "0") + 1n).toString();
   host.write("sweep_sequence", sweep_id);
   host.write("sweep:" + token_id, sweep_id);
+  emitEvent(host, "sweep_started", { token_id, sweep_id, exit_id: config.exit_id });
   return { token_id, sweep_id };
 }
 export function checkSweep(host: Host, token: string, id: string): void {

@@ -296,7 +296,8 @@ untouched. Previously applied mixed-change tightening remains active.
 Guardian-only `propose_owner_recovery({owner_id})` stores a unique proposal ID,
 replacement account and `activate_after` in nanoseconds. Inspect with
 `get_pending_owner_recovery()`. Creation clears pending policy and guardian-initiated guardian changes;
-owner-proposed and cold-key-proposed guardian changes survive.
+owner-proposed guardian changes survive. A pending cold-key guardian change blocks
+recovery creation and activation (`cold_key_guardian_change_pending`).
 Recovery freezes all policy loosening, including enablement, and policy activation;
 owner tightening, disabling and cancellation remain available. Existing bounded
 agent payments continue. Owner-only `cancel_owner_recovery()` uses the current
@@ -331,7 +332,7 @@ view adds `owner_proposed` (boolean). Owner proposals take priority over competi
 cannot overwrite one (`owner_guardian_change_pending`), and recovery proposals
 cannot erase one. The owner can propose during pending recovery. Guardian-initiated
 changes remain blocked during recovery and are cleared when recovery starts.
-Current-guardian-only `cancel_guardian_change()` authenticates through NEAR
+For ordinary changes, current-guardian-only `cancel_guardian_change()` authenticates through NEAR
 `predecessor_account_id` and requires zero attached deposit. It immediately clears
 any ordinary pending guardian replacement, including owner proposals, even after maturity.
 Cold-key proposals are protected from this veto (`cold_key_guardian_change_pending`).
@@ -346,7 +347,8 @@ clears that recovery atomically. The displaced guardian immediately loses all
 guardian permissions; its queued recovery can never activate afterward.
 Conversely, recovery activated first clears an ordinary pending guardian change, preventing
 the former owner's queued administration from surviving loss of ownership.
-There is no automatic priority between matured activations: receipt order decides.
+For ordinary guardian changes, receipt order decides between matured activations.
+A pending cold-key proposal blocks owner recovery regardless of either deadline.
 A responsive owner should veto recovery before waiting for replacement maturity.
 Replacement identities must differ from current owner, guardian, agent, immutable exit and guard.
 All mutation calls require zero deposit. Authentication uses current NEAR
@@ -412,29 +414,105 @@ cannot revoke already scheduled authorization. Existing dependency findings and
 unaudited status remain applicable.
 
 
-### Cold-key guardian recovery (PR #11)
+### Cold-key guardian recovery (PR #12)
 
 Only the immutable `exit_id` predecessor can call
 `propose_cold_key_guardian_change({guardian_id})`, with zero deposit. The pending
 view exposes `cold_key_proposed: true`. This supersedes any guardian proposal and
 uses a fresh proposal ID and the full fixed 24-hour delay. Only cold custody can
-supersede a protected proposal, restarting that delay. Activation uses the existing
+supersede a protected proposal, restarting that delay. The current owner can veto
+it with `cancel_guardian_change()`, before or after maturity, until activation.
+The guardian, exit and strangers cannot veto a cold-key proposal. An owner veto
+changes no recovery, cooldown, policy or payment state. Activation uses the existing
 permissionless `activate_guardian_change({proposal_id})` method.
 
 Neither owner nor guardian can overwrite a protected proposal. The current guardian
 cannot cancel it, before or after its deadline (`cold_key_guardian_change_pending`).
 Ordinary proposals retain their existing guardian veto rules. Policy freeze, pending
 owner recovery, disabled policies and owner-veto cooldown do not restrict cold-key
-proposal or activation. Owner recovery creation and activation preserve protected
-proposals. An owner recovery whose target equals the protected guardian target
-cannot activate (`separate_replacement_required`), preserving account separation
-and preventing the old guardian from occupying the cold-key replacement account.
+proposal or activation. While a cold-key proposal is pending, both owner recovery creation and
+activation reject with `cold_key_guardian_change_pending`, even for a different
+target or an already-mature recovery. Existing recovery remains queued and keeps
+its policy freeze; guardian activation clears it. Owner veto of the cold proposal
+resumes that recovery at its original deadline. Veto the owner recovery separately
+if it is malicious; an already-mature recovery can activate immediately after the
+cold proposal is vetoed. If recovery executes before the cold proposal is received,
+the recovered owner has normal owner veto authority.
 
 Guardian activation atomically clears queued owner recovery and revokes the old
 guardian's policy veto, identity administration and sweep authority. It preserves
 payment accounting, replay markers, policy state, cooldown and immutable `exit_id`.
 The old guardian retains its current permissions until activation; monitor and
-activate promptly after the deadline. Cold-key compromise now permits delayed
-guardian takeover, so keep this account independently controlled and offline except
+activate promptly after the deadline. Cold-key compromise permits delayed
+guardian takeover if the owner does not veto within the window, so monitor events
+and keep this account independently controlled and offline except
 when recovery or custody operations require it. Losing cold-key authority removes
 this protected escape path; it cannot be rotated or restored by the contract.
+
+
+## PR #12 security follow-up
+
+Review source: https://github.com/ScapeXYZ/Payguard/pull/12#issuecomment-6312350793
+(retrieved verbatim through GitHub CLI). This implements the review's explicit
+option to block both recovery proposal and activation while a cold proposal is
+pending. No storage migration or exported method changes are needed: the existing
+`cancel_guardian_change` dispatches by proposal kind. Ordinary changes retain
+current-guardian-only veto; cold proposals require the current owner. There is no
+new guardian veto, delay bypass, exit setter, sweep destination or access key.
+
+Security review: authorization uses predecessor, including on veto and callbacks;
+checks precede writes and success events. Fresh proposals retain unique IDs and
+24-hour delays. Cold guardian activation clears queued recovery in the same
+receipt and immediately revokes the displaced guardian. Owner veto preserves the
+queued recovery and its original deadline. Payment accounting and sweep locks
+are untouched. An exit-only thief can still gain guardian authority if the owner
+fails to veto; this is a monitored delay, not permanent protection. A stolen exit
+can repeatedly propose and obstruct recovery until the owner responds. A recovery
+that executes before the cold proposal still wins by receipt ordering. Existing
+malicious-token, callback-lock, native-balance and immutable-custody risks remain.
+Locked deployed contracts cannot upgrade; this source change requires a new guard.
+
+### Monitoring events
+
+Events follow [NEP-297](https://github.com/near/NEPs/blob/master/neps/nep-0297.md):
+`EVENT_JSON:` followed by JSON with `standard: "payguard"`, `version: "1.0.0"`,
+`event` and a one-element `data` array. Every payload includes `actor_id` (receipt
+predecessor) and decimal-string `timestamp_ns`. IDs, deadlines and amounts are
+strings to avoid precision loss. Consumers must filter the emitting guard account
+and successful receipt outcomes; token logs and failed receipts are not authority.
+
+- `owner_recovery_proposed`, `guardian_change_proposed`: full pending identity
+  (`proposal_id`, `account_id`, `activate_after`, applicable proposal-kind flags),
+  `previous_account_id`, and nullable `superseded_proposal_id`.
+- `owner_recovery_vetoed`, `guardian_change_vetoed`: full canceled identity.
+  No-op cancellation emits no event.
+- `recovery_cooldown_started`: vetoed `proposal_id` and `cooldown_until`.
+- `owner_recovery_activated`, `guardian_change_activated`: full activated identity,
+  `previous_account_id`, and nullable `cleared_proposal_id` for the other identity
+  queue invalidated by activation.
+- `sweep_started`: `token_id`, `sweep_id`, immutable `exit_id`.
+- `sweep_transfer_scheduled`: those fields plus decimal-string `amount` from the
+  balance query. Scheduling does not mean transfer success.
+- `sweep_finished`: `token_id`, `sweep_id`, `exit_id`, and `status`:
+  `transferred`, `transfer_failed`, `zero_balance` (also `amount: "0"`), or
+  `balance_query_failed`. Join by guard/token/sweep ID to obtain the scheduled
+  amount. A malicious token can still misreport balance or successful execution.
+
+Cooldown expiry is a timestamp, not an automatic transaction or event. Proposal
+supersession and activation invalidation are described in their triggering event;
+indexers should update the corresponding pending views accordingly. Recovery
+creation still clears pending policy and guardian-initiated ordinary changes.
+
+
+Validation: 21 reference tests, 43 deterministic contract tests and 10 targeted
+cold-key/event tests passed, as did TypeScript checking, the WASM build, the
+unchanged export allowlist and `git diff --check`. The full NEAR Sandbox run
+passed nine scenarios; its final scenario encountered a stale assertion expecting
+the stranger to have recovered owner authority. With recovery now blocked, the
+correct rejection is `owner_or_guardian_only`. After correcting that expectation,
+the complete cold-key scenario passed on targeted Sandbox rerun. All ten Sandbox
+scenarios were thus validated. Sandbox also verified real event payloads across
+successful sweeps, failed transfers, failed balance queries and zero balances.
+Restricted execution denied local TCP listeners (`EPERM`); Sandbox validation
+used approved unrestricted local execution. No contract changes followed the
+successful WASM build. No frontend changes, commits, pushes or deployment were made.

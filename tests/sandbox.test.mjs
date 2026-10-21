@@ -433,6 +433,25 @@ test("Sandbox: cold exit sweeps full balances, fails safely and serializes recei
   const f = await fixture(t);
   const args = { token_id: f.token.accountId, receiver_id: f.stranger.accountId, exit_id: f.stranger.accountId };
   const opts = { gas: 200_000_000_000_000n };
+  const sweepWithEvents = async (caller, input, expected, amount) => {
+    const result = await caller.callRaw(f.guard, "emergency_sweep", input, opts);
+    assert.equal(result.failed, false);
+    const events = result.logs.filter(log => log.startsWith("EVENT_JSON:")).map(log => JSON.parse(log.slice(11)))
+      .filter(event => event.standard === "payguard");
+    const expectedNames = ["sweep_started", ...(amount && amount !== "0" ? ["sweep_transfer_scheduled"] : []), "sweep_finished"];
+    assert.deepEqual(events.map(event => event.event), expectedNames);
+    const id = events[0].data[0].sweep_id;
+    for (const event of events) {
+      assert.equal(event.version, "1.0.0");
+      assert.equal(event.data.length, 1);
+      const data = event.data[0];
+      assert.equal(data.token_id, input.token_id); assert.equal(data.sweep_id, id);
+      assert.equal(data.exit_id, f.exit.accountId); assert.match(data.timestamp_ns, /^[0-9]+$/);
+      assert.equal(data.actor_id, event.event === "sweep_started" ? caller.accountId : f.guard.accountId);
+    }
+    assert.equal(events.at(-1).data[0].status, expected);
+    if (amount !== undefined) assert.equal(events.find(event => event.event === "sweep_transfer_scheduled" || event.event === "sweep_finished").data[0].amount, amount);
+  };
   await assert.rejects(f.owner.call(f.guard, "init", { owner_id: f.owner.accountId, agent_id: f.agent.accountId, guardian_id: f.guardian.accountId, exit_id: f.stranger.accountId }), /already initialized/i);
   for (const caller of [f.stranger]) {
     await assert.rejects(caller.call(f.guard, "emergency_sweep", args, opts), /owner_or_guardian_only/);
@@ -460,7 +479,7 @@ test("Sandbox: cold exit sweeps full balances, fails safely and serializes recei
   assert.equal(await f.balance(f.exit), "500000000");
   assert.equal(await f.balance(f.stranger), "0");
   assert.deepEqual(await f.spending(), spending);
-  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", args, opts), "zero_balance");
+  await sweepWithEvents(f.guardian, args, "zero_balance", "0");
   // Another token has no policy and exit is initially unregistered.
   // Avoid the default 100 NEAR transfer from the already-funded fixture owner.
   // Match the primary token's 10 NEAR budget for contract storage and gas.
@@ -470,17 +489,17 @@ test("Sandbox: cold exit sweeps full balances, fails safely and serializes recei
   await f.owner.call(other, "storage_deposit", { account_id: f.guard.accountId });
   await f.owner.call(other, "ft_transfer", { receiver_id: f.guard.accountId, amount: "123" }, { attachedDeposit: 1n });
   const second = { token_id: other.accountId };
-  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", second, opts), "transfer_failed");
+  await sweepWithEvents(f.guardian, second, "transfer_failed", "123");
   assert.equal(await other.view("ft_balance_of", { account_id: f.guard.accountId }), "123");
   await f.owner.call(other, "storage_deposit", { account_id: f.exit.accountId });
-  assert.equal(await f.guardian.call(f.guard, "emergency_sweep", second, opts), "transferred");
+  await sweepWithEvents(f.guardian, second, "transferred", "123");
   assert.equal(await other.view("ft_balance_of", { account_id: f.exit.accountId }), "123");
   // Missing ft_balance_of gives a recoverable query failure on every retry.
-  for (let i = 0; i < 2; i++) assert.equal(await f.owner.call(f.guard, "emergency_sweep", { token_id: f.stranger.accountId }, opts), "balance_query_failed");
+  for (let i = 0; i < 2; i++) await sweepWithEvents(f.owner, { token_id: f.stranger.accountId }, "balance_query_failed");
   assert.equal((await f.guard.view("get_config")).exit_id, f.exit.accountId);
 });
 
-test("Sandbox: cold-key recovery resists veto before and after deadline and survives owner activation", { timeout: 600000 }, async (t) => {
+test("Sandbox: cold-key recovery permits owner veto and blocks the guardian recovery race", { timeout: 600000 }, async (t) => {
   const f = await fixture(t);
   const next = await f.owner.createSubAccount("cold-next", { initialBalance: 10n ** 24n });
   const waitUntil = async (deadline) => {
@@ -522,9 +541,18 @@ test("Sandbox: cold-key recovery resists veto before and after deadline and surv
   }
   await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /identity_timelocked/);
   await waitUntil(cooldown);
+  await assert.rejects(f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId }), /cold_key_guardian_change_pending/);
+  await assert.rejects(f.stranger.call(f.guard, "cancel_guardian_change", {}), /owner_only/);
+  await assert.rejects(f.owner.call(f.token, "forward_identity", {
+    guard_id: f.guard.accountId, method: "cancel_guardian_change", args: {},
+  }, { gas: 100_000_000_000_000n }), /owner_only/);
+  const veto = await f.owner.callRaw(f.guard, "cancel_guardian_change", {});
+  assert.equal(veto.failed, false);
+  assert.ok(veto.logs.some(log => log.startsWith("EVENT_JSON:") && JSON.parse(log.slice(11)).event === "guardian_change_vetoed"));
+  await assert.rejects(f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: first.proposal_id }), /no_pending_identity/);
+  for (const caller of [f.exit, next]) await assert.rejects(caller.call(f.guard, "emergency_sweep", { token_id: f.token.accountId }, { gas: 200_000_000_000_000n }), /owner_or_guardian_only/);
   await f.guardian.call(f.guard, "propose_owner_recovery", { owner_id: f.stranger.accountId });
   const recovery = await f.guard.view("get_pending_owner_recovery");
-  await assert.rejects(f.owner.call(f.guard, "set_policy", { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
   // Re-propose during the recovery freeze; even cold custody must wait a fresh day.
   await f.exit.call(f.guard, "propose_cold_key_guardian_change", args);
   const pending = await f.guard.view("get_pending_guardian_change");
@@ -533,9 +561,9 @@ test("Sandbox: cold-key recovery resists veto before and after deadline and surv
   await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /cold_key_guardian_change_pending/);
   await waitUntil(pending.activate_after);
   await assert.rejects(f.guardian.call(f.guard, "cancel_guardian_change", {}), /cold_key_guardian_change_pending/);
-  await f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: recovery.proposal_id });
+  await assert.rejects(f.stranger.call(f.guard, "activate_owner_recovery", { proposal_id: recovery.proposal_id }), /cold_key_guardian_change_pending/);
   assert.deepEqual(await f.guard.view("get_pending_guardian_change"), pending);
-  await assert.rejects(f.stranger.call(f.guard, "propose_guardian_change", args), /cold_key_guardian_change_pending/);
+  await assert.rejects(f.stranger.call(f.guard, "propose_guardian_change", args), /owner_or_guardian_only/);
   await f.stranger.call(f.guard, "activate_guardian_change", { proposal_id: pending.proposal_id });
   const config = await f.guard.view("get_config");
   assert.equal(config.guardian_id, next.accountId);
