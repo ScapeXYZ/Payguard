@@ -12,7 +12,9 @@ function fixture() {
   let deposit = 0n;
   let gas = MIN_PAY_GAS;
   let storage = new Map<string, string>();
+  const logs: string[] = [];
   const host: Host = {
+    log: (message) => { logs.push(message); },
     predecessor: () => caller, currentAccount: () => "guard.test.near",
     attachedDeposit: () => deposit, prepaidGas: () => gas, timestamp: () => now,
     read: (key) => storage.get(key) ?? null, write: (key, value) => { storage.set(key, value); },
@@ -29,7 +31,7 @@ function fixture() {
   const payment = { token_id: policy.token_id, recipient_id: policy.recipients[0], amount: "40000000" };
   let sequence = 0;
   return {
-    host, config, policy, payment,
+    host, config, policy, payment, logs,
     caller: (value: string) => { caller = value; },
     time: (value: bigint) => { now = value; },
     deposit: (value: bigint) => { deposit = value; },
@@ -693,7 +695,7 @@ test("cold-key guardian recovery authenticates exit, validates separation and re
   assert.throws(() => activateGuardianChange(f.host, f.config, first.proposal_id), /proposal_id_mismatch/);
 });
 
-for (const mode of ["pending", "cooldown", "owner-activated", "collision"]) {
+for (const mode of ["pending", "cooldown", "mature-recovery", "collision"]) {
   test(`cold-key proposal survives guardian interference and ${mode} recovery`, async () => {
     const { beginSweep } = await import("../contract/policy.ts");
     const f = fixture(); const old = f.config.guardian_id;
@@ -703,6 +705,7 @@ for (const mode of ["pending", "cooldown", "owner-activated", "collision"]) {
     proposeOwnerRecovery(f.host, f.config, mode === "collision" ? "safe.near" : "newowner.near");
     const recovery = getPendingOwnerRecovery(f.host)!;
     if (mode === "cooldown") { f.caller(f.config.owner_id); cancelOwnerRecovery(f.host, f.config); }
+    if (mode === "mature-recovery") f.time(BigInt(recovery.activate_after));
     f.caller(f.config.exit_id);
     proposeColdKeyGuardianChange(f.host, f.config, "safe.near");
     const pending = getPendingGuardianChange(f.host)!;
@@ -716,7 +719,7 @@ for (const mode of ["pending", "cooldown", "owner-activated", "collision"]) {
     f.caller(old);
     assert.throws(() => cancelGuardianChange(f.host, f.config), /cold_key_guardian_change_pending/);
     if (mode !== "cooldown") {
-      proposeOwnerRecovery(f.host, f.config, recovery.account_id);
+      assert.throws(() => proposeOwnerRecovery(f.host, f.config, recovery.account_id), /cold_key_guardian_change_pending/);
       assert.deepEqual(getPendingGuardianChange(f.host), pending);
       f.caller(f.config.owner_id);
       assert.throws(() => setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
@@ -727,8 +730,11 @@ for (const mode of ["pending", "cooldown", "owner-activated", "collision"]) {
     assert.throws(() => cancelGuardianChange(f.host, f.config), /cold_key_guardian_change_pending/);
     f.time(BigInt(pending.activate_after) + 1n);
     assert.throws(() => cancelGuardianChange(f.host, f.config), /cold_key_guardian_change_pending/);
-    if (mode === "owner-activated") activateOwnerRecovery(f.host, f.config, getPendingOwnerRecovery(f.host)!.proposal_id);
-    if (mode === "collision") assert.throws(() => activateOwnerRecovery(f.host, f.config, getPendingOwnerRecovery(f.host)!.proposal_id), /separate_replacement_required/);
+    if (mode !== "cooldown") {
+      const snapshot = f.snapshot(); const logs = f.logs.length;
+      assert.throws(() => activateOwnerRecovery(f.host, f.config, recovery.proposal_id), /cold_key_guardian_change_pending/);
+      assert.deepEqual(f.snapshot(), snapshot); assert.equal(f.logs.length, logs);
+    }
     assert.deepEqual(getPendingGuardianChange(f.host), pending);
     f.caller("stranger.near"); activateGuardianChange(f.host, f.config, pending.proposal_id);
     assert.equal(f.config.guardian_id, "safe.near");
@@ -750,14 +756,94 @@ for (const mode of ["pending", "cooldown", "owner-activated", "collision"]) {
 
 
 test("cold-key activation remains possible strictly inside owner-veto cooldown", () => {
-  const f = fixture(); f.caller(f.config.exit_id);
-  proposeColdKeyGuardianChange(f.host, f.config, "safe.near");
-  const pending = getPendingGuardianChange(f.host)!;
-  f.time(f.host.timestamp() + 1n); f.caller(f.config.guardian_id);
+  const f = fixture(); f.caller(f.config.guardian_id);
   proposeOwnerRecovery(f.host, f.config, "newowner.near");
-  f.caller(f.config.owner_id); cancelOwnerRecovery(f.host, f.config);
+  f.caller(f.config.exit_id); proposeColdKeyGuardianChange(f.host, f.config, "safe.near");
+  const pending = getPendingGuardianChange(f.host)!;
+  f.time(f.host.timestamp() + 1n); f.caller(f.config.owner_id);
+  cancelOwnerRecovery(f.host, f.config);
   f.time(BigInt(pending.activate_after));
   assert.ok(f.host.timestamp() < BigInt(getRecoveryCooldown(f.host)));
   activateGuardianChange(f.host, f.config, pending.proposal_id);
   assert.equal(f.config.guardian_id, "safe.near");
+});
+
+for (const mature of [false, true]) {
+  test(`owner veto of cold proposal, mature=${mature}, prevents exit-only sweep takeover`, async () => {
+    const { beginSweep } = await import("../contract/policy.ts");
+    const f = fixture(); f.caller(f.config.guardian_id);
+    proposeOwnerRecovery(f.host, f.config, "recovered.near");
+    const recovery = getPendingOwnerRecovery(f.host)!;
+    f.time(BigInt(recovery.activate_after)); // Even already mature recovery is blocked.
+    f.caller(f.config.exit_id); proposeColdKeyGuardianChange(f.host, f.config, "attacker.near");
+    const pending = getPendingGuardianChange(f.host)!;
+    if (mature) f.time(BigInt(pending.activate_after));
+    const before = f.snapshot(); const logs = f.logs.length;
+    for (const caller of [f.config.guardian_id, "stranger.near", f.config.exit_id, f.config.agent_id]) {
+      f.caller(caller); assert.throws(() => cancelGuardianChange(f.host, f.config));
+      assert.deepEqual(f.snapshot(), before); assert.equal(f.logs.length, logs);
+    }
+    assert.throws(() => activateOwnerRecovery(f.host, f.config, recovery.proposal_id), /cold_key_guardian_change_pending/);
+    f.caller(f.config.owner_id); f.deposit(1n);
+    assert.throws(() => cancelGuardianChange(f.host, f.config), /zero_deposit/); f.deposit(0n);
+    cancelGuardianChange(f.host, f.config);
+    assert.deepEqual(f.snapshot(), before.map(([k, v]) => [k, k === "pending_guardian_change" ? "null" : v]));
+    assert.throws(() => activateGuardianChange(f.host, f.config, pending.proposal_id), /no_pending_identity/);
+    f.gas(200_000_000_000_000n);
+    for (const caller of [f.config.exit_id, "attacker.near"]) {
+      f.caller(caller); assert.throws(() => beginSweep(f.host, f.config, f.policy.token_id), /owner_or_guardian_only/);
+    }
+    // Veto resumes the existing recovery; it never silently discards it.
+    activateOwnerRecovery(f.host, f.config, recovery.proposal_id);
+    assert.equal(f.config.owner_id, "recovered.near");
+    f.caller(f.config.exit_id); proposeColdKeyGuardianChange(f.host, f.config, "safe.near");
+    f.caller("owner.test.near"); assert.throws(() => cancelGuardianChange(f.host, f.config), /owner_only/);
+    f.caller(f.config.owner_id); cancelGuardianChange(f.host, f.config);
+  });
+}
+
+test("NEP-297 identity, veto, cooldown and sweep payloads", async () => {
+  const { beginSweep } = await import("../contract/policy.ts");
+  const f = fixture();
+  const event = (name: string) => {
+    const raw = f.logs.at(-1)!; assert.ok(raw.startsWith("EVENT_JSON:"));
+    const parsed = JSON.parse(raw.slice(11));
+    assert.deepEqual({ standard: parsed.standard, version: parsed.version, event: parsed.event },
+      { standard: "payguard", version: "1.0.0", event: name });
+    assert.equal(parsed.data.length, 1);
+    assert.equal(parsed.data[0].actor_id, f.host.predecessor());
+    assert.equal(parsed.data[0].timestamp_ns, f.host.timestamp().toString());
+    return parsed.data[0];
+  };
+  f.caller(f.config.guardian_id); proposeOwnerRecovery(f.host, f.config, "nextowner.near");
+  const recovery = getPendingOwnerRecovery(f.host)!;
+  assert.equal(event("owner_recovery_proposed").account_id, recovery.account_id);
+  f.caller(f.config.owner_id); cancelOwnerRecovery(f.host, f.config);
+  const veto = JSON.parse(f.logs.at(-2)!.slice(11));
+  assert.equal(veto.event, "owner_recovery_vetoed");
+  assert.deepEqual(veto.data, [{ ...recovery, actor_id: f.config.owner_id,
+    timestamp_ns: f.host.timestamp().toString() }]);
+  assert.equal(event("recovery_cooldown_started").cooldown_until, getRecoveryCooldown(f.host));
+  f.caller(f.config.exit_id); proposeColdKeyGuardianChange(f.host, f.config, "safe.near");
+  const pending = getPendingGuardianChange(f.host)!;
+  assert.deepEqual(event("guardian_change_proposed"), { ...pending, previous_account_id: f.config.guardian_id,
+    superseded_proposal_id: null, actor_id: f.config.exit_id, timestamp_ns: f.host.timestamp().toString() });
+  f.caller(f.config.owner_id); cancelGuardianChange(f.host, f.config);
+  assert.deepEqual(event("guardian_change_vetoed"), { ...pending,
+    actor_id: f.config.owner_id, timestamp_ns: f.host.timestamp().toString() });
+  const count = f.logs.length;
+  cancelOwnerRecovery(f.host, f.config);
+  assert.equal(f.logs.length, count); // No fictitious veto or cooldown on a no-op.
+  proposeGuardianChange(f.host, f.config, "safe.near");
+  const ordinary = getPendingGuardianChange(f.host)!;
+  assert.equal(event("guardian_change_proposed").owner_proposed, true);
+  f.time(BigInt(ordinary.activate_after)); activateGuardianChange(f.host, f.config, ordinary.proposal_id);
+  assert.equal(event("guardian_change_activated").previous_account_id, "guardian.test.near");
+  f.caller(f.config.guardian_id); proposeOwnerRecovery(f.host, f.config, "nextowner.near");
+  const next = getPendingOwnerRecovery(f.host)!;
+  f.time(BigInt(next.activate_after)); activateOwnerRecovery(f.host, f.config, next.proposal_id);
+  assert.equal(event("owner_recovery_activated").previous_account_id, "owner.test.near");
+  f.gas(200_000_000_000_000n); const sweep = beginSweep(f.host, f.config, f.policy.token_id);
+  assert.equal(event("sweep_started").sweep_id, sweep.sweep_id);
+  assert.equal(event("sweep_started").exit_id, f.config.exit_id);
 });

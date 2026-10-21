@@ -4,10 +4,11 @@ import {
   activatePolicy, cancelPolicy, disablePolicy, getPendingPolicy,
   getRecoveryCooldown, proposeOwnerRecovery, cancelOwnerRecovery, activateOwnerRecovery, getPendingOwnerRecovery,
   proposeColdKeyGuardianChange, proposeGuardianChange, cancelGuardianChange, activateGuardianChange, getPendingGuardianChange,
-  beginSweep, checkSweep, finishSweep, amount, type Host, type Payment,
+  emitEvent, beginSweep, checkSweep, finishSweep, amount, type Host, type Payment,
 } from "./policy";
 
 const host: Host = {
+  log: (message) => near.log(message),
   predecessor: () => near.predecessorAccountId(),
   currentAccount: () => near.currentAccountId(),
   attachedDeposit: () => near.attachedDeposit(),
@@ -108,14 +109,17 @@ class PayGuard {
       balance = result === "0" ? "0" : amount(result).toString();
     } catch (_) {
       finishSweep(host, token_id, sweep_id);
+      emitEvent(host, "sweep_finished", { token_id, sweep_id, exit_id: this.exit_id, status: "balance_query_failed" });
       return "balance_query_failed";
     }
     if (balance === "0") {
       finishSweep(host, token_id, sweep_id);
+      emitEvent(host, "sweep_finished", { token_id, sweep_id, exit_id: this.exit_id, status: "zero_balance", amount: "0" });
       return "zero_balance";
     }
     // Registration is enforced by ft_transfer itself. Never auto-register or
     // select a fallback recipient on failure.
+    emitEvent(host, "sweep_transfer_scheduled", { token_id, sweep_id, exit_id: this.exit_id, amount: balance });
     return NearPromise.new(token_id).functionCall("ft_transfer", JSON.stringify({
       receiver_id: this.exit_id, amount: balance,
     }), 1n, TRANSFER_GAS).then(NearPromise.new(near.currentAccountId()).functionCall(
@@ -128,6 +132,7 @@ class PayGuard {
     let status = "transferred";
     try { near.promiseResult(0); } catch (_) { status = "transfer_failed"; }
     finishSweep(host, token_id, sweep_id);
+    emitEvent(host, "sweep_finished", { token_id, sweep_id, exit_id: this.exit_id, status });
     return status;
   }
 
