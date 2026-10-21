@@ -1,6 +1,6 @@
 // Payguard view-call client.
 // Shapes mirror contract/guard.ts @view methods 1:1 (ScapeXYZ/Payguard main).
-// Mock mode until NEXT_PUBLIC_GUARD_CONTRACT is set; then every view is a real
+// Defaults to the live testnet guard.myvirusmy.testnet; NEXT_PUBLIC_GUARD_CONTRACT=mock gives mock data. Every view is a real
 // NEAR RPC `call_function` query. Write calls (set_policy, pay, cancel_*,
 // propose_*, activate_*, emergency_sweep) are NOT here: they are wired by the
 // contract author through NEAR Wallet Selector (see lib/wallet.ts).
@@ -91,8 +91,9 @@ const mockClient: GuardClient = {
   get_recovery_cooldown: async () => "0",
 };
 
-const CONTRACT = process.env.NEXT_PUBLIC_GUARD_CONTRACT;
-export const guard: GuardClient = CONTRACT ? rpcClient(CONTRACT) : mockClient;
+// Live testnet guard (deployed from main @ #13). NEXT_PUBLIC_GUARD_CONTRACT overrides it; "mock" forces mock data.
+export const GUARD_CONTRACT_ID = process.env.NEXT_PUBLIC_GUARD_CONTRACT ?? "guard.myvirusmy.testnet";
+export const guard: GuardClient = GUARD_CONTRACT_ID && GUARD_CONTRACT_ID !== "mock" ? rpcClient(GUARD_CONTRACT_ID) : mockClient;
 
 // Tokens the UI tracks (the contract has no token list view).
 export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? "usdc.fakes.testnet").split(",").map((s) => s.trim());
