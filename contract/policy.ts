@@ -92,25 +92,34 @@ export function setPolicy(host: Host, config: Config, input: {
   const old = getPolicy(host, token);
   const tightening = old !== null && cap <= BigInt(old.max_per_payment) &&
     daily <= BigInt(old.daily_limit) && recipients.every(id => old.recipients.includes(id));
+  const cancelled = getPendingPolicy(host);
   if (tightening) {
     host.write("pending_policy", "null");
     host.write("policy:" + token, JSON.stringify(target));
+    emitPolicyCancellation(host, cancelled, "tightened");
+    emitEvent(host, "policy_tightened", { token_id: token, policy: target });
     return;
   }
   requireThat(getPendingOwnerRecovery(host) === null, "recovery_pending");
   requireThat(getPendingPolicy(host) === null, "pending_policy_exists");
   // Apply the intersection now: mixed changes cannot postpone tightening.
+  let immediate: TokenPolicy | null = null;
   if (old !== null) {
-    host.write("policy:" + token, JSON.stringify({
+    immediate = {
       max_per_payment: (cap < BigInt(old.max_per_payment) ? cap : BigInt(old.max_per_payment)).toString(),
       daily_limit: (daily < BigInt(old.daily_limit) ? daily : BigInt(old.daily_limit)).toString(),
       recipients: old.recipients.filter(id => recipients.includes(id)),
-    }));
+    };
+    host.write("policy:" + token, JSON.stringify(immediate));
   }
   const proposal_id = (BigInt(host.read("policy_sequence") ?? "0") + 1n).toString();
   host.write("policy_sequence", proposal_id);
   host.write("pending_policy", JSON.stringify({ proposal_id, token_id: token, policy: target,
     activate_after: (host.timestamp() + POLICY_DELAY_NS).toString() }));
+  if (immediate !== null && JSON.stringify(immediate) !== JSON.stringify(old)) {
+    emitEvent(host, "policy_tightened", { token_id: token, policy: immediate, proposal_id });
+  }
+  emitEvent(host, "policy_proposed", { ...getPendingPolicy(host) });
   // Never edit spending or request markers.
 }
 
@@ -122,18 +131,28 @@ export function getPendingPolicy(host: Host): PendingPolicy | null {
   return JSON.parse(host.read("pending_policy") ?? "null");
 }
 
+function emitPolicyCancellation(host: Host, pending: PendingPolicy | null, reason: string): void {
+  if (pending !== null) emitEvent(host, "policy_cancelled", { ...pending, reason });
+}
+
 export function cancelPolicy(host: Host, config: Config): void {
   zeroDeposit(host);
   requireThat([config.owner_id, config.guardian_id].includes(host.predecessor()), "owner_or_guardian_only");
+  const pending = getPendingPolicy(host);
   host.write("pending_policy", "null");
+  emitPolicyCancellation(host, pending, host.predecessor() === config.guardian_id ? "guardian_veto" : "owner_cancel");
 }
 
 export function disablePolicy(host: Host, config: Config, token: unknown): void {
   zeroDeposit(host);
   requireThat(host.predecessor() === config.owner_id, "owner_only");
   const id = accountId(token);
+  const pending = getPendingPolicy(host);
+  const previous_policy = getPolicy(host, id);
   host.write("pending_policy", "null");
   host.write("policy:" + id, "null");
+  emitPolicyCancellation(host, pending, "disabled");
+  if (previous_policy !== null) emitEvent(host, "policy_disabled", { token_id: id, previous_policy });
 }
 
 export function activatePolicy(host: Host, proposalId: unknown): void {
@@ -145,6 +164,7 @@ export function activatePolicy(host: Host, proposalId: unknown): void {
   requireThat(host.timestamp() >= BigInt(pending.activate_after), "policy_timelocked");
   host.write("policy:" + pending.token_id, JSON.stringify(pending.policy));
   host.write("pending_policy", "null");
+  emitEvent(host, "policy_activated", { ...pending });
 }
 
 export function getPolicy(host: Host, token: unknown): TokenPolicy | null {
@@ -229,8 +249,10 @@ function proposeIdentity(host: Host, config: Config, replacement: unknown, recov
     superseded_proposal_id: superseded?.proposal_id ?? null,
   });
   if (recovery) {
+    const pendingPolicy = getPendingPolicy(host);
     host.write("pending_policy", "null");
     if (!getPendingGuardianChange(host)?.owner_proposed && !getPendingGuardianChange(host)?.cold_key_proposed) host.write("pending_guardian_change", "null");
+    emitPolicyCancellation(host, pendingPolicy, "owner_recovery");
   }
 }
 export function proposeOwnerRecovery(host: Host, config: Config, replacement: unknown): void {

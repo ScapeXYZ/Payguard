@@ -481,6 +481,31 @@ predecessor) and decimal-string `timestamp_ns`. IDs, deadlines and amounts are
 strings to avoid precision loss. Consumers must filter the emitting guard account
 and successful receipt outcomes; token logs and failed receipts are not authority.
 
+Policy lifecycle events (same envelope and version):
+
+- `policy_proposed`: full queued target: `token_id`, `proposal_id`, `policy`
+  (`max_per_payment`, `daily_limit`, canonical deduplicated `recipients`), and
+  `activate_after`. First enablement and re-enablement wait the same 24 hours.
+- `policy_tightened`: `token_id` and the immediately effective `policy`. Mixed
+  changes also include the queued `proposal_id`, emitted before `policy_proposed`.
+  Pure loosening emits only the proposal event. Accepted non-loosening no-ops
+  emit this event too, consistent with their immediate policy write.
+- `policy_activated`: full pending proposal copied to the active policy; actor is
+  the permissionless activator, not necessarily the proposing owner.
+- `policy_cancelled`: full removed pending proposal and `reason`: `owner_cancel`,
+  `guardian_veto`, `tightened`, `disabled`, or `owner_recovery`. Implicit global
+  cancellation reports the pending token even if another token triggered it.
+- `policy_disabled`: `token_id` and `previous_policy`, only when an active policy
+  existed. A pending-only disable still emits its cancellation. Repeated disable
+  or cancellation with nothing to remove emits no corresponding event.
+
+Policy events follow successful storage writes and validation. Rejected calls emit
+no policy events. Cancellation precedes tightening/disable events; recovery-driven
+cancellation follows the identity proposal event. Cancellation never restores the
+pre-mixed policy. Indexers must retain immediate tightening when removing a queued
+target. Payloads contain public policy configuration only, never keys or credentials.
+Spending, replay markers, permissions and timelock durations are unchanged.
+
 - `owner_recovery_proposed`, `guardian_change_proposed`: full pending identity
   (`proposal_id`, `account_id`, `activate_after`, applicable proposal-kind flags),
   `previous_account_id`, and nullable `superseded_proposal_id`.
