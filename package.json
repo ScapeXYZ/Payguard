@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "npm run test:reference && npm run test:contract && npm run test:deployment",
+    "test": "npm run test:reference && npm run test:contract && npm run test:deployment && npm run test:runner && npm run test:evidence",
     "test:deployment": "node --test tests/deploy-testnet.test.mjs",
     "deploy:testnet": "node scripts/deploy-testnet.mjs",
     "test:reference": "node --experimental-strip-types src/checkPayment.test.ts",
@@ -15,7 +15,11 @@
     "build:fixture": "near-sdk-js build tests/mock-ft.ts build/mock-ft.wasm",
     "test:sandbox": "npm run build && npm run build:fixture && node --test --test-concurrency=1 tests/sandbox.test.mjs",
     "test:all": "npm test && npm run check && npm run test:sandbox",
-    "setup:tools": "node scripts/setup-tools.mjs"
+    "setup:tools": "node scripts/setup-tools.mjs",
+    "test:runner": "node tests/pay-agent.test.mjs",
+    "pay:agent": "node scripts/pay-agent.mjs",
+    "evidence:export": "node scripts/export-payment-evidence.mjs",
+    "test:evidence": "node tests/export-payment-evidence.test.mjs"
   },
   "engines": {
     "node": ">=22.6"
