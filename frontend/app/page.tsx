@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import Link from "next/link";
 import { Check, ChevronLeft, ChevronRight, Lock, Bot, User, ShieldHalf, LogOut } from "lucide-react";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Mono, WiredByYou } from "@/components/ui";
 import { guard } from "@/lib/guard";
@@ -20,6 +21,7 @@ const STEPS: { key: Role; title: string; icon: typeof User; what: string; rule: 
 
 export default function Setup() {
   const { data: config } = useView(() => guard.get_config());
+  const [rerun, setRerun] = useState(false);
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<Record<Role, string>>({ owner_id: "", agent_id: "", guardian_id: "", exit_id: "" });
   const [sent, setSent] = useState(false);
@@ -36,6 +38,32 @@ export default function Setup() {
   const cur = STEPS[step];
   const canNext = !review && !!form[cur.key] && !errors[cur.key];
 
+  // A live, initialised guard is a dashboard, not a setup flow. init() can only run once.
+  if (config && guard.mode !== "mock" && !rerun) return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold">Your guard is live</h1>
+        <p className="text-muted-foreground">Initialised on <Mono>{guard.contractId}</Mono> ({guard.mode}). Roles are fixed here; changes go through Guardian.</p>
+      </div>
+      <Card>
+        <CardContent className="divide-y divide-border p-0">
+          {STEPS.map((s) => (
+            <div key={s.key} className="flex items-center justify-between gap-4 p-3 text-sm">
+              <span className="flex items-center gap-2"><s.icon className="size-4 text-muted-foreground" /> {s.title}</span>
+              <span className="flex items-center gap-2"><Mono>{config[s.key]}</Mono>{s.key === "exit_id" && <Badge variant="warn">permanent</Badge>}</span>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+      <div className="flex flex-wrap gap-2">
+        <Button asChild><Link href="/payments/">Payments &amp; caps <ChevronRight /></Link></Button>
+        <Button asChild variant="outline"><Link href="/guardian/">Guardian &amp; recovery</Link></Button>
+        <Button asChild variant="outline"><Link href="/sweep/">Emergency sweep</Link></Button>
+        <Button variant="ghost" onClick={() => setRerun(true)}>Set up a new guard</Button>
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       <FirstVisitGuide />
@@ -44,7 +72,7 @@ export default function Setup() {
         <p className="text-muted-foreground">Four accounts, each with one job. Nothing here can be bypassed later by the agent.</p>
       </div>
 
-      {config && guard.mode !== "mock" && (
+      {config && guard.mode !== "mock" && rerun && (
         <Card><CardContent className="pt-5 text-sm">Already initialised: owner <Mono>{config.owner_id}</Mono> · exit <Mono>{config.exit_id}</Mono></CardContent></Card>
       )}
 
