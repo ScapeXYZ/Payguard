@@ -15,8 +15,9 @@ Next.js (app router) + Tailwind + shadcn/ui, static export.
 ## Data
 
 - `lib/guard.ts` = every `@view` from `contract/guard.ts`, same names and shapes.
-  - no env → mock data
-  - `NEXT_PUBLIC_GUARD_CONTRACT=<your-guard>.testnet` → real NEAR RPC view calls (testnet by default; `NEXT_PUBLIC_NEAR_NETWORK=mainnet` to switch)
+  - no env → live testnet guard `guard.myvirusmy.testnet` (real NEAR RPC view calls)
+  - `NEXT_PUBLIC_GUARD_CONTRACT=mock` → mock data
+  - `NEXT_PUBLIC_GUARD_CONTRACT=<other-guard>.testnet` → that guard (testnet by default; `NEXT_PUBLIC_NEAR_NETWORK=mainnet` to switch)
   - `NEXT_PUBLIC_GUARD_TOKENS=usdc.fakes.testnet,...` → tokens to show (add decimals in `TOKEN_META`)
 - `lib/wallet.ts` = every write call, typed with the exact args. Simulated until NEAR Wallet Selector is wired in `signAndSend`.
 - Payment history on `/payments` is sample data; the contract has no history view, use an indexer (NearBlocks) later.
