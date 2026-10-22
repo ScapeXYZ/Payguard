@@ -7,10 +7,10 @@ import { Button } from "./ui";
 const KEY = "payguard.guide.dismissed.v1";
 
 export const GUIDE_STEPS = [
-  { n: 1, href: "/", title: "Set up roles", what: "pick the owner (you), the agent, a guardian key and a cold exit account" },
+  { n: 1, href: "/", title: "Overview", what: "who holds which role, what the agent can spend, what is pending" },
   { n: 2, href: "/payments/", title: "Set caps", what: "max per payment, daily limit, and who the agent is allowed to pay" },
   { n: 3, href: "/guardian/", title: "Guardian", what: "every key change waits 24h, so you or the guardian can stop it" },
-  { n: 4, href: "/sweep/", title: "Sweep if something's wrong", what: "one step moves everything to the exit account" },
+  { n: 4, href: "/sweep/", title: "Sweep if something's wrong", what: "owner or guardian can move a token's balance to the fixed exit account" },
 ];
 
 // Shown until dismissed; rendered by default so it is in the static HTML, hidden after mount if dismissed.
@@ -38,7 +38,7 @@ export function FirstVisitGuide() {
     <div className="relative rounded-xl border border-primary/40 bg-primary/5 p-5">
       <button aria-label="Dismiss guide" onClick={dismiss} className="absolute right-3 top-3 rounded p-1 text-muted-foreground hover:bg-muted"><X className="size-4" /></button>
       <div className="flex items-center gap-2 text-sm font-medium text-primary"><Compass className="size-4" /> New here? Start here</div>
-      <p className="mt-1 pr-6 text-sm">Payguard gives your AI agent a wallet it can't drain: it can only pay inside the limits you set, and you can always pull the money out.</p>
+      <p className="mt-1 pr-6 text-sm">PayGuard lets your AI agent request payments, but the contract only pays inside the limits you set, and the owner or guardian can sweep funds to a fixed exit account.</p>
       <ol className="mt-4 grid gap-3 md:grid-cols-4">
         {GUIDE_STEPS.map((s) => (
           <li key={s.n}>
