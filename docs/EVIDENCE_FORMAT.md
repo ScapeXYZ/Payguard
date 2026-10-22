@@ -1,21 +1,23 @@
-# Proposed payment evidence contract (schema version 1)
+# Payment evidence v2 contract
 
-This is a proposed frontend integration contract; no frontend evidence spec was
-present during implementation. Partner confirmation is required before treating
-this as a stable API. The configured `~/payguard-agent-journal` was absent during
-implementation; schema inspection and validation used the runner and fixtures,
-not live payment evidence. Pending USDC policy/proposal #2 is not evidence of an
-active policy or payment and is never attached to records by default.
+The offline exporter emits `payguard.evidence.v2` for the frontend partner.
+Pending policy/proposal IDs are never attached to payments without evidence.
 
 ## Produce evidence
 
 ```sh
 npm run evidence:export -- \
+  --network testnet \
+  --guard guard.testnet \
   --journal "$HOME/payguard-agent-journal" \
   --output /absolute/existing/export-directory/payment-evidence.json
 ```
 
-Both arguments are required absolute paths. The journal must exist; absence is an
+`--network` (`testnet` or `mainnet`) and `--guard` (canonical account ID) are
+required deployment identifiers, even for an empty journal. Every entry must
+match both; mixed deployments fail the entire export before replacing output.
+These identifiers scope evidence; they do not independently verify the chain.
+`--journal` and `--output` are required absolute paths. The journal must exist; absence is an
 error, not an empty history. The output parent must exist and output must end in
 `.json`, outside the journal. Existing regular single-link output files may be
 replaced. Journal directory symlinks, entry symlinks/hardlinks, output symlinks and
@@ -33,21 +35,36 @@ temporary files in the output directory.
 
 No RPC calls, credentials, SDK signing, broadcasts or key/policy changes occur.
 To refresh evidence, separately reconcile using authorized operational tooling;
-this exporter does not invoke the payment runner. Same journal snapshots produce
-byte-identical output. There is no wall-clock export timestamp. A concurrent
+this exporter does not invoke the payment runner. Records from the same journal snapshots have deterministic content and request-ID
+ordering. `generated_at` is the UTC ISO-8601 export time, so exports may differ
+in that field. It is not evidence time and never proves on-chain verification. A concurrent
 runner can replace individual snapshots during the scan: each file is atomic,
 but the export is not a transactionally consistent snapshot of the directory.
 
 ## JSON and frontend consumption
 
-The file is an object `{ "schema_version": 1, "records": [...] }`. Records are
+The file is an object:
+
+```json
+{
+  "schema": "payguard.evidence.v2",
+  "network": "testnet",
+  "guard_id": "guard.testnet",
+  "generated_at": "2026-10-23T10:00:00.000Z",
+  "source": "runner_journal",
+  "records": []
+}
+```
+
+This empty example is illustrative, not live evidence. Network and guard appear
+only in the envelope. `source` is required both in the envelope and every record.
+Records are
 sorted by request ID using code-unit order. Each record contains:
 
 | Field | Type and meaning |
 | --- | --- |
 | request_id | String; business ID, unique within this export |
-| network | `testnet` or `mainnet` |
-| guard_id, agent_id, recipient_id, token_id | Validated account ID strings from persisted intent |
+| agent_id, recipient_id, token_id | Validated account ID strings from persisted intent |
 | amount | Canonical positive u128 integer string in base units; never a JS number |
 | status | One of the five statuses below |
 | reason | Fixed safe classification code or null; never raw exceptions |
@@ -55,12 +72,12 @@ sorted by request ID using code-unit order. Each record contains:
 | explorer_url | Network-specific NearBlocks transaction URL derived from validated hash, or null |
 | settlement_receipt_id | Verified successful FT receipt ID or null |
 | source | `runner_journal` |
-| verified_at | Timestamp of persisted evidence observation, or null; not export time |
+| verified_at | Required key: UTC ISO timestamp of persisted classified receipt observation, or null when absent/invalid/unclassified; not export time or block time |
 | note | Fixed description of uncertainty or verification limits |
-| scenario, token_symbol, token_decimals | Currently null; runner does not persist authoritative scenario/metadata |
+| scenario, token_symbol, token_decimals | Currently null; scenario may only be A–E or null. Runner has no authoritative scenario/token metadata |
 | block_height, block_timestamp_ns | Currently null; no verified block header enrichment |
 | recipient_balance_before, recipient_balance_after | Currently null; no historical balance evidence |
-| policy_id, proposal_id | Currently null; runner does not persist policy/proposal identity |
+| policy_id, proposal_id | Currently null; policy_id needs independent contract evidence; proposal_id must be a decimal string or null, never a number |
 
 Do not infer symbols/decimals from account names, USDC assumptions or UI defaults.
 Display unknown metadata as unknown and amount as a base-unit string. Future
@@ -70,7 +87,8 @@ injected. Do not seed Attack Lab outcomes from this export.
 
 Load the generated JSON via the frontend's configured read-only data endpoint or
 bundled asset; the exporter itself does not serve HTTP or copy files into the
-frontend. Validate `schema_version === 1`, array shape and unique request IDs before
+frontend. Validate `schema === "payguard.evidence.v2"`, expected network/guard, all required
+record keys (including nullable keys), array shape and unique request IDs before
 rendering. Replace the displayed snapshot atomically, rather than appending rows
 on every refresh. Treat request IDs as scoped to this configured journal; a future
 multi-journal integration needs a network/guard/request composite identity.
@@ -107,10 +125,8 @@ even if the runner records success. Raw logs and failure text are never exported
 
 ## Frontend partner confirmation needed
 
-- Confirm the versioned envelope, null handling, fixed statuses and the distinction
-  between `reserved` (unverified FT completion) and `pending` (insufficient evidence).
 - Confirm how to supply/host the generated asset and refresh/stale-state behavior.
-- Confirm scenario vocabulary for transaction history and Attack Lab; the runner
+- Confirm how authoritative A–E scenario evidence will be supplied for transaction history and Attack Lab; the runner
   has no authoritative scenario field and the exporter will not guess one.
 - Confirm the provenance contract for future token metadata, block headers,
   historical balances and active policy/proposal IDs. Proposal #2 alone must not

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const fail = () => { throw new Error('Invalid evidence input or unsafe output path'); };
-const matches = (v, re) => typeof v === 'string' && re.test(v);
+const matches = (v, re) => typeof v === 'string' && re.exec(v)?.[0] === v;
 const id = v => matches(v, /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/) && v.length >= 2 && v.length <= 64;
 const hash = v => matches(v, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/) ? v : null;
 const success = s => s && (Object.hasOwn(s, 'SuccessValue') || Object.hasOwn(s, 'SuccessReceiptId'));
@@ -61,14 +61,15 @@ export function project(entry) {
     }
     if (r.status !== 'pending') {
       r.note = 'Classified from persisted FINAL RPC receipt evidence; RPC and token semantics are trusted. Balances are not reconciled.';
-      if (matches(event.at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/) && Number.isFinite(Date.parse(event.at))) r.verified_at = event.at;
+      if (matches(event.at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/) && Number.isFinite(Date.parse(event.at)) && new Date(event.at).toISOString() === event.at) r.verified_at = event.at;
     }
   }
   r.explorer_url = r.tx_hash ? `https://${i.network === 'testnet' ? 'testnet.' : ''}nearblocks.io/txns/${r.tx_hash}` : null;
   return r;
 }
 
-export async function exportEvidence({ journal, output }) {
+export async function exportEvidence({ journal, output, network, guard }) {
+  if (!['testnet', 'mainnet'].includes(network) || !id(guard)) fail();
   if (!isAbsolute(journal ?? '') || !isAbsolute(output ?? '') || basename(output) === '.' || !output.endsWith('.json')) fail();
   if ((await lstat(journal)).isSymbolicLink() || !(await lstat(journal)).isDirectory()) fail();
   const directory = await realpath(journal);
@@ -85,11 +86,13 @@ export async function exportEvidence({ journal, output }) {
     try { const s = await handle.stat(); if (!s.isFile() || s.nlink !== 1 || s.size > 16 * 1024 * 1024) fail(); entry = JSON.parse(await handle.readFile('utf8')); }
     finally { await handle.close(); }
     const record = project(entry);
-    if (seen.has(record.request_id)) fail();
+    if (record.network !== network || record.guard_id !== guard || seen.has(record.request_id)) fail();
+    delete record.network; delete record.guard_id;
     seen.add(record.request_id); records.push(record);
   }
   records.sort((a, b) => a.request_id < b.request_id ? -1 : a.request_id > b.request_id ? 1 : 0);
-  const payload = JSON.stringify({ schema_version: 1, records }, null, 2) + '\n';
+  const payload = JSON.stringify({ schema: 'payguard.evidence.v2', network, guard_id: guard,
+    generated_at: new Date().toISOString(), source: 'runner_journal', records }, null, 2) + '\n';
   const temp = join(parent, `.evidence-${randomUUID()}`);
   try {
     const handle = await open(temp, 'wx', 0o600);
@@ -104,11 +107,11 @@ export async function exportEvidence({ journal, output }) {
 export function parseArgs(args) {
   const result = {};
   for (let n = 0; n < args.length; n += 2) {
-    const key = { '--journal': 'journal', '--output': 'output' }[args[n]];
+    const key = { '--journal': 'journal', '--output': 'output', '--network': 'network', '--guard': 'guard' }[args[n]];
     if (!key || result[key] || !args[n + 1]) fail();
     result[key] = args[n + 1];
   }
-  if (!result.journal || !result.output) fail();
+  if (!result.journal || !result.output || !['testnet', 'mainnet'].includes(result.network) || !id(result.guard)) fail();
   return result;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
