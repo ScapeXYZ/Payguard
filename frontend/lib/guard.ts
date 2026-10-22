@@ -95,10 +95,13 @@ const mockClient: GuardClient = {
 export const GUARD_CONTRACT_ID = process.env.NEXT_PUBLIC_GUARD_CONTRACT ?? "guard.myvirusmy.testnet";
 export const guard: GuardClient = GUARD_CONTRACT_ID && GUARD_CONTRACT_ID !== "mock" ? rpcClient(GUARD_CONTRACT_ID) : mockClient;
 
+// Circle native USDC on NEAR testnet (the live guard's policy token).
+export const CIRCLE_USDC_TESTNET = "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af";
 // Tokens the UI tracks (the contract has no token list view).
-export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? "usdc.fakes.testnet").split(",").map((s) => s.trim());
+export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? (GUARD_CONTRACT_ID === "mock" ? "usdc.fakes.testnet" : CIRCLE_USDC_TESTNET)).split(",").map((s) => s.trim());
 export const TOKEN_META: Record<string, { symbol: string; decimals: number }> = {
   "usdc.fakes.testnet": { symbol: "USDC", decimals: 6 },
+  [CIRCLE_USDC_TESTNET]: { symbol: "USDC", decimals: 6 },
 };
 
 // Simulated activity for the payments screen. The contract emits no payment
