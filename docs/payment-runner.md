@@ -68,7 +68,17 @@ validation/preflight; 2 for unresolved/prepared state. CLI output includes publi
 request ID, transaction hash and state. Detailed receipt outcomes/errors live in
 `<journal>/<request-id>.json`. The CLI deliberately avoids dumping raw exceptions,
 credentials, or signed transaction bytes. For a stopped preflight, check the
-arguments, file permissions, network, guard identity and on-chain key permission.
+operation label and safe error code first. For example,
+`Preflight status: RPC transport: EAI_AGAIN` means DNS resolution failed before
+any chain/configuration/key query; check network access and DNS. RPC errors show
+only their numeric JSON-RPC code, never provider error text or data. Credential
+loading failures identify missing/inaccessible files or invalid credential format
+without printing file contents. Raw exceptions remain withheld.
+
+Dry-run does not open, validate, lock, or modify the journal directory, even when
+it already exists. A successful dry-run therefore does not certify journal
+permissions or readiness for execution. Paths must be shell-expanded absolute
+paths (for example, use `$HOME/...` when quoting rather than a literal `~`).
 
 ## Durability and retries
 

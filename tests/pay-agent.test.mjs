@@ -1,4 +1,7 @@
 import { test } from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, chmod, rm, mkdir, symlink, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -244,4 +247,107 @@ test('valid JSON corruption cannot erase signed state or re-create a business re
     await assert.rejects(runPayment(f.c, { rpc: f.rpc }));
   }
   assert.equal(f.calls.filter(x => x.method === 'send_tx').length, 1);
+});
+test('dry-run DNS failure identifies status transport without exposing raw errors or retrying', async t => {
+  const f = await fixture(t);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    throw new TypeError(`fetch failed ${f.key.toString()} sensitive payload`, { cause: Object.assign(new Error('sensitive DNS details'), { code: 'EAI_AGAIN' }) });
+  });
+  await assert.rejects(runPayment({ ...f.c, mode: 'dry-run' }), e => {
+    assert.equal(e.safeMessage, 'Preflight status: RPC transport: EAI_AGAIN');
+    assert.equal(e.message.includes(f.key.toString()), false);
+    return true;
+  });
+  assert.equal(calls, 1);
+  await assert.rejects(access(f.c.journal), { code: 'ENOENT' });
+});
+test('dry-run ignores existing locked, malformed, loose-permission journal', async t => {
+  const f = await fixture(t);
+  await mkdir(f.c.journal, { mode: 0o755 });
+  await writeFile(join(f.c.journal, '.runner.lock'), 'sensitive lock contents');
+  const path = join(f.c.journal, `${f.c.requestId}.json`);
+  await writeFile(path, 'sensitive malformed journal');
+  assert.equal((await runPayment({ ...f.c, mode: 'dry-run' }, { rpc: f.rpc })).mode, 'dry-run');
+  assert.equal(await readFile(path, 'utf8'), 'sensitive malformed journal');
+  assert.deepEqual(f.calls.map(x => x.method), ['status', 'block', 'query', 'query']);
+});
+test('preflight RPC errors identify the exact operation and only disclose numeric codes', async t => {
+  const f = await fixture(t);
+  for (const target of ['block', 'get_config', 'view_access_key']) {
+    t.mock.method(globalThis, 'fetch', async (_, options) => {
+      const { method, params } = JSON.parse(options.body);
+      const operation = params.method_name ?? params.request_type ?? method;
+      if (operation === target) return { ok: true, json: async () => ({ error: { code: -32000, message: f.key.toString(), data: 'sensitive signed bytes' } }) };
+      return { ok: true, json: async () => ({ result: await f.rpc(method, params) }) };
+    });
+    const label = { block: 'finalized block', get_config: 'guard get_config', view_access_key: 'agent view_access_key' }[target];
+    await assert.rejects(runPayment({ ...f.c, mode: 'dry-run' }), e => e.safeMessage === `Preflight ${label}: RPC error code -32000`);
+  }
+});
+test('missing or malformed credential and invalid RPC JSON produce safe diagnostics', async t => {
+  const f = await fixture(t);
+  await assert.rejects(runPayment({ ...f.c, credentials: join(f.c.journal, 'missing'), mode: 'dry-run' }), e => e.safeMessage === 'Credential loading: ENOENT');
+  await writeFile(f.c.credentials, `{"private_key":"${f.key.toString()}" broken`);
+  await assert.rejects(runPayment({ ...f.c, mode: 'dry-run' }), e => e.safeMessage === 'Credential loading: Credential is not valid JSON');
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => { throw new SyntaxError(f.key.toString()); } }));
+  await assert.rejects(runPayment({ ...f.c, mode: 'dry-run' }, { key: f.key }), e => e.safeMessage === 'Preflight status: RPC response is not valid JSON');
+});
+
+// Preload fetch in a fresh process so the real entry point, argv and output run.
+test('actual CLI and npm dry-run serialize nonce and keep diagnostics secret-free', async t => {
+  const f = await fixture(t);
+  const preload = join(f.c.credentials, '..', 'mock-rpc.mjs');
+  await writeFile(preload, `
+    import { appendFileSync } from 'node:fs';
+    globalThis.fetch = async (_, options) => {
+      const { method, params } = JSON.parse(options.body);
+      appendFileSync(process.env.CLI_CALLS, method + '\\n');
+      if (process.env.CLI_ERROR) throw new Error(process.env.CLI_SECRET);
+      let result;
+      if (method === 'status') result = { chain_id: 'testnet', sync_info: { syncing: false } };
+      else if (method === 'block') result = { header: { hash: ${JSON.stringify(blockHash)} } };
+      else if (method === 'query' && params.request_type === 'call_function')
+        result = { result: [...Buffer.from(JSON.stringify({ agent_id: 'agent.testnet' }))] };
+      else if (method === 'query' && params.request_type === 'view_access_key')
+        result = { nonce: Number.MAX_SAFE_INTEGER, permission: { FunctionCall: {
+          receiver_id: 'guard.testnet', method_names: ['pay'], allowance: '1'
+        } } };
+      else throw new Error('Unexpected RPC');
+      return { ok: true, json: async () => ({ result }) };
+    };
+  `);
+  const args = Object.entries({ network: f.c.network, rpc: f.c.rpc, guard: f.c.guard,
+    agent: f.c.agent, 'request-id': f.c.requestId, token: f.c.token, recipient: f.c.recipient,
+    amount: f.c.amount, credentials: f.c.credentials, journal: f.c.journal })
+    .flatMap(([name, value]) => ['--' + name, value]).concat('--dry-run');
+  const calls = join(f.c.credentials, '..', 'calls');
+  const cwd = fileURLToPath(new URL('../', import.meta.url));
+  const env = { ...process.env, NODE_OPTIONS: `--import=${preload}`, CLI_CALLS: calls,
+    CLI_SECRET: f.key.toString(), CLI_ERROR: '' };
+  const launch = promisify(execFile);
+  for (const [command, prefix] of [[process.execPath, ['scripts/pay-agent.mjs']],
+    ['npm', ['run', '--silent', 'pay:agent', '--']]]) {
+    await writeFile(calls, '');
+    const { stdout, stderr } = await launch(command, [...prefix, ...args], { cwd, env });
+    assert.ok(stdout.trim(), `${command} returned empty output; stderr: ${stderr}`);
+    const result = JSON.parse(stdout);
+    assert.equal(result.mode, 'dry-run');
+    assert.equal(result.nonce, '9007199254740992');
+    assert.equal(result.intent.payment.request_id, f.c.requestId);
+    assert.equal(stderr, '');
+    assert.equal(stdout.includes(f.key.toString()), false);
+    assert.deepEqual((await readFile(calls, 'utf8')).trim().split('\n'), ['status', 'block', 'query', 'query']);
+  }
+  await assert.rejects(launch(process.execPath, ['scripts/pay-agent.mjs', ...args], {
+    cwd, env: { ...env, CLI_ERROR: '1' },
+  }), error => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /Preflight status: RPC transport: operation failed \(details withheld\)/);
+    assert.equal(error.stderr.includes(f.key.toString()), false);
+    return true;
+  });
+  await assert.rejects(access(f.c.journal), { code: 'ENOENT' });
 });

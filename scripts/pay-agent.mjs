@@ -11,6 +11,17 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const GAS = 80_000_000_000_000n;
 const U128_MAX = (1n << 128n) - 1n;
 const fail = message => { const error = new Error(message); error.safeMessage = message; throw error; };
+// Only fixed labels/codes reach the CLI; never include raw exception messages.
+async function stage(label, operation) {
+  try { return await operation(); }
+  catch (error) {
+    if (error.safeMessage) fail(`${label}: ${error.safeMessage}`);
+    const code = error.cause?.code ?? error.code;
+    const known = ['ENOENT', 'EACCES', 'EPERM', 'ELOOP', 'ENOTDIR', 'EISDIR', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'];
+    const reason = known.includes(code) ? code : ['TimeoutError', 'AbortError'].includes(error.name) ? 'request timed out or aborted' : 'operation failed (details withheld)';
+    fail(`${label}: ${reason}`);
+  }
+}
 const exact = (s, re) => typeof s === 'string' && re.exec(s)?.[0] === s;
 function account(s) {
   if (!exact(s, /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/) || s.length < 2 || s.length > 64) fail('Invalid canonical account ID');
@@ -19,7 +30,8 @@ function account(s) {
 export function validate(input) {
   const { network, rpc, guard, agent, requestId, token, recipient, amount, credentials, journal } = input;
   if (!['testnet', 'mainnet'].includes(network)) fail('Explicit --network testnet or mainnet required');
-  const url = new URL(rpc);
+  let url;
+  try { url = new URL(rpc); } catch { fail('Invalid RPC URL'); }
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) fail('RPC must be HTTPS without credentials, query, or fragment');
   [guard, agent, token, recipient].forEach(account);
   if (guard === agent || guard === token || guard === recipient) fail('Guard, agent, token and recipient configuration invalid');
@@ -61,22 +73,30 @@ async function secureFile(path) {
 export async function loadAgentKey(path, agent) {
   await external(path);
   if ((await lstat(path)).isSymbolicLink()) fail('Credential symlinks forbidden');
-  const data = JSON.parse(await secureFile(path));
+  let data;
+  const contents = await secureFile(path);
+  try { data = JSON.parse(contents); } catch { fail('Credential is not valid JSON'); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) fail('Invalid credential object');
   if (data.account_id !== agent) fail('Credential agent account mismatch');
-  const key = KeyPair.fromString(data.private_key ?? data.secret_key);
+  let key;
+  try { key = KeyPair.fromString(data.private_key ?? data.secret_key); } catch { fail('Invalid credential signing key'); }
   if (!data.public_key?.startsWith('ed25519:')) fail('Only ed25519 agent keys supported');
   if (key.getPublicKey().toString() !== data.public_key) fail('Credential public key mismatch');
   return key;
 }
 export function makeRpc(url) {
   return async (method, params = {}) => {
-    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(30_000), body: JSON.stringify({ jsonrpc: '2.0', id: 'payguard-agent', method, params }) });
+    const response = await stage('RPC transport', () => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(30_000), body: JSON.stringify({ jsonrpc: '2.0', id: 'payguard-agent', method, params }) }));
     if (!response.ok) fail(`RPC HTTP ${response.status}`);
-    const json = await response.json();
+    let json;
+    try { json = await response.json(); } catch { fail('RPC response is not valid JSON'); }
+    if (!json || typeof json !== 'object' || Array.isArray(json)) fail('Malformed RPC response');
     if (json.error) {
       const error = new Error(JSON.stringify(json.error));
       error.rpcError = json.error;
+      // Numeric JSON-RPC codes are useful without echoing provider-controlled text/data.
+      error.safeMessage = `RPC error${Number.isSafeInteger(json.error.code) ? ' code ' + json.error.code : ''}`;
       throw error;
     }
     if (!Object.hasOwn(json, 'result')) fail('Malformed RPC response');
@@ -84,14 +104,16 @@ export function makeRpc(url) {
   };
 }
 export async function preflight(c, key, rpc) {
-  const status = await rpc('status');
+  const status = await stage('Preflight status', () => rpc('status'));
   if (status.chain_id !== c.network || status.sync_info?.syncing !== false) fail('RPC network mismatch or syncing');
-  const block = await rpc('block', { finality: 'final' });
+  const block = await stage('Preflight finalized block', () => rpc('block', { finality: 'final' }));
+  if (typeof block?.header?.hash !== 'string') fail('Preflight finalized block: missing block hash');
   const query = args => rpc('query', { ...args, block_id: block.header.hash });
-  const configResult = await query({ request_type: 'call_function', account_id: c.guard, method_name: 'get_config', args_base64: 'e30=' });
-  const config = JSON.parse(Buffer.from(configResult.result).toString());
-  if (config.agent_id !== c.agent) fail('Guard agent identity mismatch');
-  const access = await query({ request_type: 'view_access_key', account_id: c.agent, public_key: key.getPublicKey().toString() });
+  const configResult = await stage('Preflight guard get_config', () => query({ request_type: 'call_function', account_id: c.guard, method_name: 'get_config', args_base64: 'e30=' }));
+  let config;
+  try { config = JSON.parse(Buffer.from(configResult.result).toString()); } catch { fail('Preflight guard get_config: invalid configuration response'); }
+  if (config?.agent_id !== c.agent) fail('Guard agent identity mismatch');
+  const access = await stage('Preflight agent view_access_key', () => query({ request_type: 'view_access_key', account_id: c.agent, public_key: key.getPublicKey().toString() }));
   const permission = access.permission?.FunctionCall;
   if (!permission || permission.receiver_id !== c.guard || !Array.isArray(permission.method_names) ||
       permission.method_names.length !== 1 || permission.method_names[0] !== 'pay' ||
@@ -160,11 +182,11 @@ export async function runPayment(input, { rpc, key } = {}) {
   const c = validate(input);
   const mode = input.mode ?? 'dry-run';
   if (!['dry-run', 'execute', 'reconcile'].includes(mode)) fail('Invalid mode');
-  key ??= await loadAgentKey(c.credentials, c.agent);
+  key ??= await stage('Credential loading', () => loadAgentKey(c.credentials, c.agent));
   rpc ??= makeRpc(c.rpc);
   const intent = intentOf(c);
   if (mode === 'dry-run') return { mode, intent, ...await preflight(c, key, rpc), gas: GAS.toString(), deposit: '0', note: 'Read-only preflight; no journal entry, signing or broadcast. Policy/transfer success is not guaranteed.' };
-  return journalStore(c.journal, async store => {
+  return stage('Journal/payment processing', () => journalStore(c.journal, async store => {
     const check = await preflight(c, key, rpc);
     let entry = await store.read(c.requestId);
     if (entry && (entry.version !== 1 || JSON.stringify(entry.intent) !== JSON.stringify(intent) || entry.public_key !== check.publicKey)) fail('Request ID already bound to different intent/key or unsupported journal');
@@ -214,7 +236,7 @@ export async function runPayment(input, { rpc, key } = {}) {
       await record('broadcast_error', { message: String(error.message), rpc: error.rpcError ?? null });
     }
     return summary(entry);
-  });
+  }));
 }
 function verifySignedEntry(entry, key) {
   const signed = transactions.SignedTransaction.decode(Buffer.from(entry.signed_transaction, 'base64'));
@@ -236,7 +258,8 @@ function summary(entry) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = await runPayment(parseArgs(process.argv.slice(2)));
-    console.log(JSON.stringify(result, null, 2));
+    // Preflight returns a BigInt nonce; preserve its precision in CLI JSON.
+    console.log(JSON.stringify(result, (_, value) => typeof value === 'bigint' ? value.toString() : value, 2));
     if (['failed', 'uncertain', 'prepared'].includes(result.state)) process.exitCode = result.state === 'failed' ? 1 : 2;
   } catch (error) {
     if (error.safeMessage) console.error(error.safeMessage);
