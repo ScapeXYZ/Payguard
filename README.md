@@ -440,3 +440,14 @@ sweep stages emit NEP-297 `EVENT_JSON` logs under `payguard` version `1.0.0`.
 See [event payloads and monitoring rules](docs/security-review.md#monitoring-events).
 Monitor successful receipts from the guard account; sweep scheduling alone does
 not establish a successful transfer.
+
+## Restricted-agent payment CLI
+
+Use `npm run pay:agent -- ... --dry-run` for read-only preflight, `--execute` for
+an explicitly authorized payment, and `--reconcile` for status lookup without
+broadcast. Network, RPC, guard, agent, external credential/journal paths, business
+request ID, token, recipient and integer-string amount are required. The runner
+persists the business intent and signed transaction hash before broadcasting;
+retries reconcile that hash and never silently create a fresh transaction.
+See [payment runner usage, security checks and recovery limits](docs/payment-runner.md).
+Run its mocked-RPC tests with `npm run test:runner` (also included in `npm test`).
