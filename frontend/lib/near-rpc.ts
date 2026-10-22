@@ -88,6 +88,15 @@ export type TxStatus = {
   transaction: { hash: string; signer_id: string; receiver_id: string; actions: unknown[] };
   transaction_outcome: ReceiptOutcome;
   receipts_outcome: ReceiptOutcome[];
+  // EXPERIMENTAL_tx_status only: the receipts themselves (who sent what to whom).
+  receipts?: TxReceipt[];
+};
+
+export type TxReceipt = {
+  receipt_id: string;
+  predecessor_id: string;
+  receiver_id: string;
+  receipt: { Action?: { actions: ({ FunctionCall?: { method_name: string; args: string; deposit: string } } | string | Record<string, unknown>)[] } } | Record<string, unknown>;
 };
 
 export async function blockTimestampNs(blockHash: string): Promise<string> {

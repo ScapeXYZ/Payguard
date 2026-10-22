@@ -23,7 +23,7 @@ Next.js (app router) + Tailwind + shadcn/ui, static export.
 - `lib/wallet.tsx` = NEAR Wallet Selector (MyNearWallet, Meteor). Signs owner, guardian and exit methods only. `pay` is not in the browser: the agent key stays with the payment runner.
 - `lib/use-tx.ts` = transaction states (awaiting signature, submitted, pending, confirmed, rejected, failed). Success is shown only after the final outcome is re-read from RPC (`lib/tx-outcome.ts`).
 - `lib/amount.ts` = exact BigInt base units; over-precise, negative or malformed amounts are refused, never rounded.
-- Payment history and the Attack Lab read the payment runner's evidence feed (`NEXT_PUBLIC_EVIDENCE_URL`, format proposed in `docs/EVIDENCE_FORMAT.md`) and re-verify each tx on chain. No feed = an explicit empty state, never sample data.
+- Payment history and the Attack Lab read the payment runner's evidence feed (`NEXT_PUBLIC_EVIDENCE_URL`, format v2 in `docs/EVIDENCE_FORMAT.md`; settled only with a verified ft_transfer receipt) and re-verify each tx on chain. No feed = an explicit empty state, never sample data.
 
 ## Run
 

@@ -10,12 +10,14 @@ import { formatUnits } from "@/lib/amount";
 import { txUrl } from "@/lib/near-rpc";
 import { short } from "@/lib/utils";
 
+// v2 labels. Only "settled" says tokens moved, and the UI shows it as fact only next to
+// "verified on chain", which for settled means the token's ft_transfer receipt succeeded.
 export const STATUS_COPY: Record<EvidenceRecord["status"], { label: string; tone: "ok" | "danger" | "warn" | "outline" }> = {
-  settled: { label: "settled: tokens moved", tone: "ok" },
-  reserved: { label: "authorized + budget reserved", tone: "warn" },
-  settlement_failed: { label: "reserved, transfer failed", tone: "danger" },
+  settled: { label: "settled: ft_transfer receipt succeeded", tone: "ok" },
+  reserved: { label: "reserved, not settled: no transfer receipt", tone: "warn" },
+  settlement_failed: { label: "reserved, ft_transfer failed", tone: "danger" },
   rejected: { label: "blocked by contract", tone: "danger" },
-  pending: { label: "pending", tone: "outline" },
+  pending: { label: "pending: outcome not final", tone: "outline" },
 };
 
 export function useVerified(records: EvidenceRecord[] | undefined) {
@@ -38,8 +40,14 @@ export function useVerified(records: EvidenceRecord[] | undefined) {
 export function VerifyBadge({ v }: { v?: Verification }) {
   if (!v) return <Badge variant="outline">checking chain...</Badge>;
   if (v.state === "verified") return <Badge variant="ok" className="gap-1"><BadgeCheck className="size-3" /> verified on chain</Badge>;
-  if (v.state === "mismatch") return <Badge variant="danger" className="gap-1" title={`chain says ${v.onchain}${v.reason ? ` (${v.reason})` : ""}`}><ShieldAlert className="size-3" /> chain disagrees: {v.onchain}</Badge>;
+  if (v.state === "mismatch") return <Badge variant="danger" className="gap-1" title={v.detail}><ShieldAlert className="size-3" /> chain disagrees: {v.onchain}</Badge>;
   return <Badge variant="outline" className="gap-1" title={v.why}><CircleHelp className="size-3" /> not verified</Badge>;
+}
+
+export function VerifyDetail({ v }: { v?: Verification }) {
+  if (!v) return null;
+  const text = v.state === "unverifiable" ? v.why : v.state === "mismatch" ? v.detail : v.settlementReceiptId ? `ft_transfer receipt ${v.settlementReceiptId.slice(0, 8)}...` : null;
+  return text ? <div className="mt-1 max-w-[220px] text-xs text-muted-foreground">{text}</div> : null;
 }
 
 // Live payment history = the runner's evidence feed, each row re-checked against RPC.
@@ -59,7 +67,7 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
         {!EVIDENCE_URL || IS_MOCK ? (
           <div className="flex items-start gap-3 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
             <FileJson className="mt-0.5 size-5 shrink-0" />
-            <div>No evidence feed connected yet. The payment runner&apos;s output format is being agreed (proposed: <Mono>docs/EVIDENCE_FORMAT.md</Mono>); set <Mono>NEXT_PUBLIC_EVIDENCE_URL</Mono> to its JSON once it exists. Nothing is shown until then: no sample data.</div>
+            <div>No evidence feed connected yet. The payment runner&apos;s output format is <Mono>docs/EVIDENCE_FORMAT.md</Mono> (v2); set <Mono>NEXT_PUBLIC_EVIDENCE_URL</Mono> to its JSON once it exists. Nothing is shown until then: no sample data.</div>
           </div>
         ) : (
           <>
@@ -76,7 +84,7 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
                         <td className="font-mono text-xs">{short(r.agent_id, 10)} → {short(r.recipient_id, 10)}</td>
                         <td>{formatUnits(r.amount, r.token_decimals)} {r.token_symbol}</td>
                         <td><Badge variant={STATUS_COPY[r.status].tone}>{STATUS_COPY[r.status].label}</Badge>{r.reason && <div className="mt-1 font-mono text-xs text-red-300">{r.reason}</div>}</td>
-                        <td><VerifyBadge v={verified[r.tx_hash]} /></td>
+                        <td><VerifyBadge v={verified[r.tx_hash]} /><VerifyDetail v={verified[r.tx_hash]} /><div className="mt-1 text-xs text-muted-foreground" title={`verified by ${r.source}`}>runner check {r.verified_at.replace("T", " ").slice(0, 16)}{r.proposal_id ? ` · policy #${r.proposal_id}` : ""}</div></td>
                         <td className="text-xs">{r.block_timestamp_ns ? new Date(Number(BigInt(r.block_timestamp_ns) / 1_000_000n)).toISOString().replace("T", " ").slice(0, 19) : "-"}</td>
                         <td><a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">{r.tx_hash.slice(0, 8)}... <ExternalLink className="size-3" /></a></td>
                       </tr>
@@ -87,7 +95,7 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
             )}
           </>
         )}
-        <p className="text-xs text-muted-foreground">&quot;Authorized + budget reserved&quot; means the guard approved the payment and counted it against today&apos;s limit. &quot;Settled&quot; means the token transfer itself also succeeded. A reservation is never released if the transfer later fails.</p>
+        <p className="text-xs text-muted-foreground">&quot;Authorized + budget reserved&quot; means the guard approved the payment and counted it against today&apos;s limit. &quot;Settled&quot; means the token transfer itself also succeeded. A reservation is never released if the transfer later fails. A row is shown as settled only when the token&apos;s own ft_transfer receipt is found on chain and succeeded; a successful guard call alone stays &quot;reserved&quot;.</p>
       </CardContent>
     </Card>
   );
