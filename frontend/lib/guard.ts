@@ -28,7 +28,7 @@ export const nowNs = () => BigInt(Date.now()) * 1_000_000n;
 
 // ---------- real RPC client ----------
 const NETWORK = (process.env.NEXT_PUBLIC_NEAR_NETWORK ?? "testnet") as "testnet" | "mainnet";
-const RPC = process.env.NEXT_PUBLIC_NEAR_RPC ?? (NETWORK === "mainnet" ? "https://rpc.mainnet.near.org" : "https://rpc.testnet.near.org");
+const RPC = process.env.NEXT_PUBLIC_NEAR_RPC ?? (NETWORK === "mainnet" ? "https://rpc.mainnet.near.org" : "https://test.rpc.fastnear.com");
 
 function b64(s: string) {
   return typeof window === "undefined" ? Buffer.from(s).toString("base64") : btoa(s);
