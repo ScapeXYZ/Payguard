@@ -11,7 +11,7 @@ import { ftBalance } from "@/lib/near-rpc";
 import { useTick, useView } from "@/lib/use-guard";
 import { useToken } from "@/lib/use-token";
 import { useWallet } from "@/lib/wallet";
-import { EVIDENCE_URL, loadEvidence } from "@/lib/evidence";
+import { EMPTY_EVIDENCE_TEXT, EVIDENCE_URL, GENERIC_GUARD_FAILURE, loadEvidence } from "@/lib/evidence";
 import { CONTRACT_ERRORS } from "@/lib/errors";
 import { cn, remaining, short } from "@/lib/utils";
 
@@ -77,11 +77,13 @@ function Overview({ config }: { config: Config }) {
         <Card>
           <CardHeader><CardTitle className="flex items-center gap-2"><Ban className="size-5 text-red-400" /> What has been blocked</CardTitle><CardDescription>Contract rejections from the payment runner&apos;s evidence.</CardDescription></CardHeader>
           <CardContent className="space-y-2 text-sm">
+            {ev.stale && ev.data && <p className="text-xs text-amber-300">Stale snapshot: the latest evidence refresh failed{ev.error ? ` (${ev.error})` : ""}.</p>}
             {!EVIDENCE_URL || IS_MOCK ? <p className="text-muted-foreground">No evidence feed connected yet, so nothing is claimed here. Rejections will appear once the runner publishes verified records.</p>
               : ev.error && !ev.data ? <p className="text-red-300">Evidence feed unavailable: {ev.error}</p>
               : !ev.data ? <p className="text-muted-foreground">Loading evidence...</p>
-              : blocked.length === 0 ? <p className="text-muted-foreground">No blocked payments in the evidence feed yet.</p>
-              : Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n}</Badge></div>)}
+              : ev.data.records.length === 0 ? <p className="text-muted-foreground">{EMPTY_EVIDENCE_TEXT}. An empty export doesn&apos;t prove there were no on-chain payments.</p>
+              : blocked.length === 0 ? <p className="text-muted-foreground">No rejected payments in the persisted evidence.</p>
+              : Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{k === GENERIC_GUARD_FAILURE ? "Guard execution failed (specific code not exported)" : CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n}</Badge></div>)}
             <Button asChild size="sm" variant="outline"><Link href="/attack-lab/"><FlaskConical /> Attack Lab</Link></Button>
           </CardContent>
         </Card>

@@ -1,37 +1,42 @@
-// Payment evidence v2 (docs/EVIDENCE_FORMAT.md), agreed with the runner owner as the base.
+// Payment evidence v2, as produced by the runner's offline exporter
+// (scripts/export-payment-evidence.mjs, contract in docs/EVIDENCE_FORMAT.md).
 // The UI never shows a record as verified on its word alone: each tx_hash is re-read from
-// RPC, the status is re-derived from the chain, and "settled" additionally requires the
-// token's ft_transfer receipt named in the record to exist and to have succeeded.
+// RPC and the status re-derived from the chain with the exporter's own receipt rules.
+// A record with no tx_hash can't be re-checked and is always "not verified".
 import { NETWORK, txStatus, type TxReceipt, type TxStatus } from "./near-rpc";
 import { classifyTx } from "./tx-outcome";
 import { describeFailure } from "./errors";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
 export const EVIDENCE_URL = process.env.NEXT_PUBLIC_EVIDENCE_URL ?? "";
+export const EMPTY_EVIDENCE_TEXT = "No persisted payment evidence available";
+// Generic exporter class: the guard receipt failed; the specific contract code isn't exported.
+export const GENERIC_GUARD_FAILURE = "guard_execution_failed";
 
 export type Scenario = "A" | "B" | "C" | "D" | "E";
 export type PaymentStatus = "rejected" | "pending" | "reserved" | "settlement_failed" | "settled";
 
+// Every key is REQUIRED to exist; the nullable ones may be null ("Unknown" in the UI).
 export type EvidenceRecord = {
   request_id: string;
   scenario: Scenario | null;
   agent_id: string;
   recipient_id: string;
   token_id: string;
-  token_symbol: string;
-  token_decimals: number;
-  amount: string;                         // base units, decimal string
+  token_symbol: string | null;
+  token_decimals: number | null;          // null = show raw base units
+  amount: string;                         // canonical positive u128, base units
   status: PaymentStatus;
-  reason: string | null;                  // rejected: contract code; settlement_failed: token failure text
-  tx_hash: string;
+  reason: string | null;                  // rejected: contract code or guard_execution_failed; settlement_failed: ft_transfer_failed
+  tx_hash: string | null;
   block_height: number | null;
   block_timestamp_ns: string | null;
-  explorer_url: string;
-  settlement_receipt_id: string | null;   // REQUIRED for settled: the token's ft_transfer receipt
-  policy_id: string | null;               // reserved: the contract has no policy id today
-  proposal_id: string | null;             // policy proposal that made the active policy, if known
-  source: string;                         // who verified THIS record (runner id + commit)
-  verified_at: string;                    // ISO 8601, when that runner verified it
+  explorer_url: string | null;            // informational only; links are derived from tx_hash
+  settlement_receipt_id: string | null;   // required for settled
+  policy_id: string | null;
+  proposal_id: string | null;
+  source: string;                         // e.g. "runner_journal"
+  verified_at: string | null;             // ISO, persisted receipt observation time
   recipient_balance_before: string | null;
   recipient_balance_after: string | null;
   note: string | null;
@@ -41,120 +46,162 @@ export type EvidenceFile = {
   schema: typeof EVIDENCE_SCHEMA;
   network: "testnet" | "mainnet";
   guard_id: string;
-  generated_at: string;                   // ISO 8601, when the file was written
-  source: string;                         // who produced the file
+  generated_at: string;                   // export time, NOT evidence time
+  source: string;
   records: EvidenceRecord[];
 };
+
+export const RECORD_KEYS = ["request_id", "scenario", "agent_id", "recipient_id", "token_id", "token_symbol", "token_decimals",
+  "amount", "status", "reason", "tx_hash", "block_height", "block_timestamp_ns", "explorer_url", "settlement_receipt_id",
+  "policy_id", "proposal_id", "source", "verified_at", "recipient_balance_before", "recipient_balance_after", "note"] as const;
 
 const STATUSES: PaymentStatus[] = ["rejected", "pending", "reserved", "settlement_failed", "settled"];
 const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const iso = (v: unknown) => str(v) && !Number.isNaN(Date.parse(v));
+const digits = (v: unknown) => typeof v === "string" && /^[0-9]+$/.test(v);
+const b58 = (v: unknown) => typeof v === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
 const nullOr = (v: unknown, ok: (x: unknown) => boolean) => v === null || ok(v);
+const u128 = (v: unknown) => typeof v === "string" && /^[1-9][0-9]{0,38}$/.test(v) && BigInt(v) < 2n ** 128n;
+const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
-// Strict shape check. One bad record rejects the file: partial evidence is worse than none.
+// Request ids are unique only within one journal export, so a row's identity is the
+// composite (network, guard, request_id) of the file it came from.
+export const evidenceKey = (f: Pick<EvidenceFile, "network" | "guard_id">, r: Pick<EvidenceRecord, "request_id">) =>
+  `${f.network}/${f.guard_id}/${r.request_id}`;
+
+// Strict check. One bad record rejects the file: partial evidence is worse than none.
 export function parseEvidence(raw: unknown, guardId: string, network: string = NETWORK): { ok: true; file: EvidenceFile } | { ok: false; error: string } {
   const f = raw as EvidenceFile;
-  if (!f || typeof f !== "object") return { ok: false, error: "evidence is not a JSON object" };
-  if (f.schema !== EVIDENCE_SCHEMA) return { ok: false, error: `schema must be "${EVIDENCE_SCHEMA}"` };
-  if (f.network !== network) return { ok: false, error: `evidence is for ${f.network}, this UI reads ${network}` };
-  if (f.guard_id !== guardId) return { ok: false, error: `evidence is for ${f.guard_id}, this UI reads ${guardId}` };
+  if (!f || typeof f !== "object" || Array.isArray(f)) return { ok: false, error: "evidence is not a JSON object" };
+  if (f.schema !== EVIDENCE_SCHEMA) return { ok: false, error: `unsupported schema (need "${EVIDENCE_SCHEMA}")` };
+  if (f.network !== network) return { ok: false, error: `evidence is for ${String(f.network)}, this UI reads ${network}` };
+  if (f.guard_id !== guardId) return { ok: false, error: `evidence is for ${String(f.guard_id)}, this UI reads ${guardId}` };
   if (!iso(f.generated_at)) return { ok: false, error: "generated_at must be ISO 8601" };
-  if (!str(f.source)) return { ok: false, error: "source (file producer) is required" };
+  if (!str(f.source)) return { ok: false, error: "source is required" };
   if (!Array.isArray(f.records)) return { ok: false, error: "records must be an array" };
+  const seen = new Set<string>();
   for (const [i, r] of f.records.entries()) {
-    const bad = (why: string) => ({ ok: false as const, error: `record ${i} (${r?.request_id ?? "?"}): ${why}` });
-    if (!r || typeof r !== "object") return bad("not an object");
+    const bad = (why: string) => ({ ok: false as const, error: `record ${i} (${typeof r?.request_id === "string" ? r.request_id : "?"}): ${why}` });
+    if (!r || typeof r !== "object" || Array.isArray(r)) return bad("not an object");
+    const missing = RECORD_KEYS.filter((k) => !has(r, k));
+    if (missing.length) return bad(`missing required keys: ${missing.join(", ")} (null is allowed, absence is not)`);
     if (!str(r.request_id) || !/^[A-Za-z0-9_-]{1,64}$/.test(r.request_id)) return bad("request_id invalid");
+    if (seen.has(r.request_id)) return bad("duplicate request_id in this export");
+    seen.add(r.request_id);
     if (!str(r.agent_id) || !str(r.recipient_id) || !str(r.token_id)) return bad("agent_id, recipient_id and token_id are required");
-    if (!/^[0-9]+$/.test(String(r.amount))) return bad("amount must be base units as a decimal string");
-    if (!Number.isInteger(r.token_decimals)) return bad("token_decimals must be an integer");
+    if (!u128(r.amount)) return bad("amount must be a canonical positive u128 base-unit string");
     if (!STATUSES.includes(r.status)) return bad(`status must be one of ${STATUSES.join(", ")}`);
-    if (!str(r.tx_hash)) return bad("tx_hash is required (rejections are real transactions too)");
-    if (r.scenario !== null && r.scenario !== undefined && !["A", "B", "C", "D", "E"].includes(r.scenario)) return bad("scenario must be A-E or null");
-    if (!str(r.source)) return bad("source (who verified this record) is required");
-    if (!iso(r.verified_at)) return bad("verified_at must be ISO 8601");
-    if (!nullOr(r.policy_id, str)) return bad("policy_id must be a string or null");
-    if (!nullOr(r.proposal_id, (x) => str(x) && /^[0-9]+$/.test(x))) return bad("proposal_id must be a decimal string or null");
-    if (!nullOr(r.settlement_receipt_id, str)) return bad("settlement_receipt_id must be a string or null");
-    if (r.status === "settled" && !str(r.settlement_receipt_id)) return bad("settled requires settlement_receipt_id (a guard success alone is never settlement)");
-    if (r.status === "rejected" && !str(r.reason)) return bad("rejected requires reason (the contract error code)");
+    if (!str(r.source)) return bad("source is required");
+    if (!nullOr(r.scenario, (x) => ["A", "B", "C", "D", "E"].includes(x as string))) return bad("scenario must be A-E or null");
+    if (!nullOr(r.token_symbol, (x) => typeof x === "string")) return bad("token_symbol must be a string or null");
+    if (!nullOr(r.token_decimals, (x) => Number.isInteger(x) && (x as number) >= 0 && (x as number) <= 38)) return bad("token_decimals must be an integer 0-38 or null");
+    if (!nullOr(r.reason, str)) return bad("reason must be a string or null");
+    if (!nullOr(r.tx_hash, b58)) return bad("tx_hash must be a base58 hash or null");
+    if (!nullOr(r.block_height, (x) => Number.isInteger(x) && (x as number) >= 0)) return bad("block_height must be an integer or null");
+    if (!nullOr(r.block_timestamp_ns, digits)) return bad("block_timestamp_ns must be a decimal string or null");
+    if (!nullOr(r.explorer_url, (x) => typeof x === "string")) return bad("explorer_url must be a string or null");
+    if (!nullOr(r.settlement_receipt_id, b58)) return bad("settlement_receipt_id must be a base58 id or null");
+    if (!nullOr(r.policy_id, (x) => typeof x === "string")) return bad("policy_id must be a string or null");
+    if (!nullOr(r.proposal_id, digits)) return bad("proposal_id must be a decimal string or null");
+    if (!nullOr(r.verified_at, iso)) return bad("verified_at must be ISO 8601 or null");
+    if (!nullOr(r.recipient_balance_before, digits) || !nullOr(r.recipient_balance_after, digits)) return bad("balances must be decimal strings or null");
+    if (!nullOr(r.note, (x) => typeof x === "string")) return bad("note must be a string or null");
+    if (r.status === "settled" && (!r.settlement_receipt_id || !r.tx_hash)) return bad("settled requires tx_hash and settlement_receipt_id (a guard success alone is never settlement)");
+    if (r.status === "rejected" && !r.reason) return bad("rejected requires reason");
   }
   return { ok: true, file: f };
 }
 
 export type Verification =
-  | { state: "verified"; onchain: PaymentStatus; reason: string | null; settlementReceiptId: string | null }
-  | { state: "mismatch"; onchain: PaymentStatus; reason: string | null; settlementReceiptId: string | null; detail: string }
+  | { state: "verified"; onchain: PaymentStatus; reason: string | null; chainCode: string | null; settlementReceiptId: string | null }
+  | { state: "mismatch"; onchain: PaymentStatus; reason: string | null; chainCode: string | null; settlementReceiptId: string | null; detail: string }
   | { state: "unverifiable"; why: string };
 
-type Settlement = { receiptId: string; result: "success" | "failure" | "pending"; message: string | null };
+type Settlement = { receiptId: string; result: "settled" | "failed" | "reserved" | "pending"; message: string | null };
 
 const decodeArgs = (b64: string): Record<string, unknown> | null => {
   try { return JSON.parse(typeof atob === "function" ? atob(b64) : Buffer.from(b64, "base64").toString("utf8")); } catch { return null; }
 };
+const isObj = (s: unknown): s is Record<string, unknown> => typeof s === "object" && s !== null;
 
-// The token's ft_transfer for THIS payment: a receipt sent by the guard to token_id,
-// calling ft_transfer with exactly this receiver_id and amount.
+// The exporter's settlement rule, applied to live RPC: the guard receipt's child receipt,
+// guard -> token_id, exactly ONE action = ft_transfer(receiver_id, amount) matching the record.
+// settled = that receipt's outcome is SuccessValue with no child receipts; Failure =
+// settlement_failed; anything else (success with children, unknown) stays reserved.
 export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" | "recipient_id" | "amount">, guardId: string): Settlement | null {
+  const roots = tx.transaction_outcome.outcome.receipt_ids;
+  const guardOut = tx.receipts_outcome.find((o) => roots.includes(o.id) && o.outcome.executor_id === guardId);
+  if (!guardOut) return null;
   const match = (tx.receipts ?? []).find((x: TxReceipt) => {
-    if (x.predecessor_id !== guardId || x.receiver_id !== r.token_id) return false;
-    const acts = (x.receipt as { Action?: { actions: unknown[] } }).Action?.actions ?? [];
-    return acts.some((a) => {
-      const fc = (a as { FunctionCall?: { method_name: string; args: string } }).FunctionCall;
-      if (!fc || fc.method_name !== "ft_transfer") return false;
-      const args = decodeArgs(fc.args);
-      return !!args && args.receiver_id === r.recipient_id && String(args.amount) === r.amount;
-    });
+    if (!guardOut.outcome.receipt_ids.includes(x.receipt_id) || x.predecessor_id !== guardId || x.receiver_id !== r.token_id) return false;
+    const acts = (x.receipt as { Action?: { actions: unknown[] } }).Action?.actions;
+    if (!Array.isArray(acts) || acts.length !== 1) return false;
+    const fc = (acts[0] as { FunctionCall?: { method_name: string; args: string } }).FunctionCall;
+    if (!fc || fc.method_name !== "ft_transfer") return false;
+    const args = decodeArgs(fc.args);
+    return !!args && args.receiver_id === r.recipient_id && args.amount === r.amount;
   });
   if (!match) return null;
-  const out = tx.receipts_outcome.find((o) => o.id === match.receipt_id);
+  const out = tx.receipts_outcome.find((o) => o.id === match.receipt_id && o.outcome.executor_id === r.token_id);
   const s = out?.outcome.status;
-  if (s && typeof s === "object" && "Failure" in s) return { receiptId: match.receipt_id, result: "failure", message: describeFailure(s.Failure) };
-  if (s && typeof s === "object" && ("SuccessValue" in s || "SuccessReceiptId" in s)) return { receiptId: match.receipt_id, result: "success", message: null };
+  if (isObj(s) && "Failure" in s) return { receiptId: match.receipt_id, result: "failed", message: describeFailure(s.Failure) };
+  if (isObj(s) && "SuccessValue" in s && out!.outcome.receipt_ids.length === 0) return { receiptId: match.receipt_id, result: "settled", message: null };
+  if (isObj(s) && ("SuccessValue" in s || "SuccessReceiptId" in s)) return { receiptId: match.receipt_id, result: "reserved", message: null };
   return { receiptId: match.receipt_id, result: "pending", message: null };
 }
 
 // Pure: re-derive the payment status from an RPC result and compare with the record.
 export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string): Verification {
+  if (!r.tx_hash) return { state: "unverifiable", why: "no transaction hash in the evidence, so it can't be checked on chain" };
+  if (tx.transaction.hash !== r.tx_hash) return { state: "unverifiable", why: "RPC returned a different transaction" };
   if (tx.transaction.receiver_id !== guardId) return { state: "unverifiable", why: `tx was sent to ${tx.transaction.receiver_id}, not the guard` };
   if (tx.transaction.signer_id !== r.agent_id) return { state: "unverifiable", why: `tx was signed by ${tx.transaction.signer_id}, not ${r.agent_id}` };
-  if (r.status === "settled" && !str(r.settlement_receipt_id)) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
+  if (r.status === "settled" && !r.settlement_receipt_id) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
 
   const o = classifyTx(tx, guardId);
-  let onchain: PaymentStatus; let reason: string | null = null; let st: Settlement | null = null;
-  if (o.status === "failed") { onchain = "rejected"; reason = o.failure?.code ?? o.failure?.message ?? null; }
-  else if (o.status === "pending" && !(st = findSettlement(tx, r, guardId))) onchain = "pending";
-  else {
-    st = st ?? findSettlement(tx, r, guardId);
-    // Guard committed the reservation. Only the token's own receipt decides settlement.
-    if (!st) onchain = o.status === "pending" ? "pending" : "reserved";
-    else if (st.result === "failure") { onchain = "settlement_failed"; reason = st.message; }
-    else if (st.result === "success") onchain = "settled";
+  let onchain: PaymentStatus; let chainCode: string | null = null; let st: Settlement | null = null; let guardFailed = false;
+  if (o.status === "failed") {
+    onchain = "rejected"; chainCode = o.failure?.code ?? o.failure?.message ?? null; guardFailed = o.failure?.executor === guardId;
+  } else {
+    st = findSettlement(tx, r, guardId);
+    if (o.status === "pending") onchain = "pending";
+    else if (!st) onchain = "reserved";
+    else if (st.result === "failed") { onchain = "settlement_failed"; chainCode = st.message; }
+    else if (st.result === "settled") onchain = "settled";
+    else if (st.result === "reserved") onchain = "reserved";
     else onchain = "pending";
   }
   const sid = st?.receiptId ?? null;
-  const base = { onchain, reason, settlementReceiptId: sid };
+  const base = { onchain, reason: r.reason, chainCode, settlementReceiptId: sid };
   const disagree = (detail: string): Verification => ({ state: "mismatch", ...base, detail });
 
-  if (onchain !== r.status) return disagree(`record says ${r.status}, chain says ${onchain}`);
-  if (onchain === "rejected" && reason !== r.reason) return disagree(`rejection code: record ${r.reason}, chain ${reason}`);
-  if ((onchain === "settled" || onchain === "settlement_failed") && r.settlement_receipt_id && r.settlement_receipt_id !== sid)
-    return disagree(`settlement receipt: record ${r.settlement_receipt_id}, chain ${sid}`);
+  if (onchain !== r.status) return disagree(r.status === "pending" ? `record is pending (evidence incomplete); chain now shows ${onchain}` : `record says ${r.status}, chain says ${onchain}`);
+  if (onchain === "rejected") {
+    // Generic class: verified when the chain shows the GUARD receipt failed, whatever the code.
+    if (r.reason === GENERIC_GUARD_FAILURE) { if (!guardFailed) return disagree(`record says the guard failed, but the failure was in ${tx.transaction.receiver_id === guardId ? "the transaction itself" : "another account"}`); }
+    else if (r.reason !== chainCode) return disagree(`rejection code: record ${r.reason}, chain ${chainCode}`);
+  }
+  if (onchain === "settled" && r.settlement_receipt_id !== sid) return disagree(`settlement receipt: record ${r.settlement_receipt_id}, chain ${sid}`);
+  if (onchain === "settlement_failed" && r.settlement_receipt_id && r.settlement_receipt_id !== sid) return disagree(`settlement receipt: record ${r.settlement_receipt_id}, chain ${sid}`);
   return { state: "verified", ...base };
 }
 
 export async function verifyRecord(r: EvidenceRecord, guardId: string): Promise<Verification> {
+  if (!r.tx_hash) return { state: "unverifiable", why: "no transaction hash in the evidence, so it can't be checked on chain" };
   let tx;
   try { tx = await txStatus(r.tx_hash, r.agent_id, "FINAL"); }
   catch (e) { return { state: "unverifiable", why: `RPC couldn't load the tx (${String((e as Error)?.message ?? e)}); older txs need an archival RPC` }; }
   return verifyAgainstTx(r, tx, guardId);
 }
 
+// Fetch failure, invalid JSON, wrong schema/network/guard = a data error, never an empty history.
 export async function loadEvidence(guardId: string): Promise<EvidenceFile | null> {
   if (!EVIDENCE_URL) return null;
   const res = await fetch(EVIDENCE_URL, { cache: "no-store" });
   if (!res.ok) throw new Error(`evidence feed returned HTTP ${res.status}`);
-  const p = parseEvidence(await res.json(), guardId);
+  let raw: unknown;
+  try { raw = await res.json(); } catch { throw new Error("evidence feed is not valid JSON"); }
+  const p = parseEvidence(raw, guardId);
   if (p.ok === false) throw new Error(`evidence feed rejected: ${p.error}`);
   return p.file;
 }
