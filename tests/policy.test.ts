@@ -847,3 +847,134 @@ test("NEP-297 identity, veto, cooldown and sweep payloads", async () => {
   assert.equal(event("sweep_started").sweep_id, sweep.sweep_id);
   assert.equal(event("sweep_started").exit_id, f.config.exit_id);
 });
+
+function policyEvent(f: ReturnType<typeof fixture>, name: string, data: Record<string, unknown>, index = -1) {
+  const raw = f.logs.at(index)!;
+  assert.ok(raw.startsWith("EVENT_JSON:"));
+  assert.deepEqual(JSON.parse(raw.slice(11)), { standard: "payguard", version: "1.0.0", event: name,
+    data: [{ ...data, actor_id: f.host.predecessor(), timestamp_ns: f.host.timestamp().toString() }] });
+}
+
+function rejectsWithoutPolicyEffects(f: ReturnType<typeof fixture>, action: () => void, error: RegExp) {
+  const state = f.snapshot();
+  const logs = [...f.logs];
+  assert.throws(action, error);
+  assert.deepEqual(f.snapshot(), state);
+  assert.deepEqual(f.logs, logs);
+}
+
+test("policy events: canonical first enablement, exact 24-hour boundary and permissionless activation", () => {
+  const f = fixture();
+  f.caller(f.config.owner_id);
+  const input = { ...f.policy, token_id: "NEW.NEAR", recipients: ["ALICE.TEST.NEAR", "alice.test.near"] };
+  setPolicy(f.host, f.config, input);
+  const pending = getPendingPolicy(f.host)!;
+  assert.equal(BigInt(pending.activate_after) - f.host.timestamp(), DAY_NS);
+  assert.deepEqual(pending.policy.recipients, ["alice.test.near"]);
+  assert.equal(pending.token_id, "new.near");
+  policyEvent(f, "policy_proposed", pending);
+  assert.equal(getPolicy(f.host, "new.near"), null);
+  f.reload();
+  for (const caller of [f.config.owner_id, f.config.agent_id, f.config.guardian_id, "stranger.near"]) {
+    f.caller(caller);
+    f.time(BigInt(pending.activate_after) - 1n);
+    rejectsWithoutPolicyEffects(f, () => activatePolicy(f.host, pending.proposal_id), /policy_timelocked/);
+  }
+  f.time(BigInt(pending.activate_after));
+  rejectsWithoutPolicyEffects(f, () => activatePolicy(f.host, "999"), /proposal_id_mismatch/);
+  activatePolicy(f.host, pending.proposal_id);
+  policyEvent(f, "policy_activated", pending);
+  assert.deepEqual(getPolicy(f.host, pending.token_id), pending.policy);
+  rejectsWithoutPolicyEffects(f, () => activatePolicy(f.host, pending.proposal_id), /no_pending_policy/);
+});
+
+test("policy events: mixed tightening, full queued target, veto and accounting preservation", () => {
+  const f = fixture(); f.tx();
+  const accounting = () => f.snapshot().filter(([key]) => key.startsWith("spent:") || key.startsWith("request:"));
+  const before = accounting();
+  f.caller(f.config.owner_id);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000", daily_limit: "80000000", recipients: ["bob.near"] });
+  const pending = getPendingPolicy(f.host)!;
+  policyEvent(f, "policy_tightened", { token_id: f.policy.token_id, proposal_id: pending.proposal_id,
+    policy: { max_per_payment: "50000000", daily_limit: "80000000", recipients: [] } }, -2);
+  policyEvent(f, "policy_proposed", pending);
+  rejectsWithoutPolicyEffects(f, () => setPolicy(f.host, f.config, f.policy), /pending_policy_exists/);
+  f.caller(f.config.guardian_id); cancelPolicy(f.host, f.config);
+  policyEvent(f, "policy_cancelled", { ...pending, reason: "guardian_veto" });
+  assert.deepEqual(getPolicy(f.host, f.policy.token_id)!.recipients, []);
+  assert.deepEqual(accounting(), before);
+  rejectsWithoutPolicyEffects(f, () => activatePolicy(f.host, pending.proposal_id), /no_pending_policy/);
+  const count = f.logs.length; cancelPolicy(f.host, f.config); assert.equal(f.logs.length, count);
+});
+
+for (const reason of ["owner_cancel", "tightened", "disabled", "owner_recovery"]) {
+  test(`policy events: global cancellation via ${reason}`, () => {
+    const f = fixture(); f.caller(f.config.owner_id);
+    setPolicy(f.host, f.config, { ...f.policy, token_id: "other.near" });
+    const pending = getPendingPolicy(f.host)!;
+    const start = f.logs.length;
+    if (reason === "owner_cancel") cancelPolicy(f.host, f.config);
+    if (reason === "tightened") setPolicy(f.host, f.config, { ...f.policy, recipients: [] });
+    if (reason === "disabled") disablePolicy(f.host, f.config, f.policy.token_id.toUpperCase());
+    if (reason === "owner_recovery") {
+      f.caller(f.config.guardian_id); proposeOwnerRecovery(f.host, f.config, "next.near");
+    }
+    const index = f.logs.findIndex((raw, i) => i >= start && JSON.parse(raw.slice(11)).event === "policy_cancelled");
+    assert.ok(index >= start);
+    policyEvent(f, "policy_cancelled", { ...pending, reason }, index);
+    assert.equal(getPendingPolicy(f.host), null);
+    if (reason === "tightened") policyEvent(f, "policy_tightened", { token_id: f.policy.token_id,
+      policy: { max_per_payment: f.policy.max_per_payment, daily_limit: f.policy.daily_limit, recipients: [] } });
+    if (reason === "disabled") {
+      const { token_id, ...previous_policy } = f.policy;
+      policyEvent(f, "policy_disabled", { token_id, previous_policy });
+      const count = f.logs.length; disablePolicy(f.host, f.config, token_id); assert.equal(f.logs.length, count);
+      setPolicy(f.host, f.config, f.policy);
+      policyEvent(f, "policy_proposed", getPendingPolicy(f.host)!);
+      assert.ok(BigInt(getPendingPolicy(f.host)!.proposal_id) > BigInt(pending.proposal_id));
+      assert.equal(getPolicy(f.host, token_id), null);
+    }
+  });
+}
+
+test("policy rejection paths emit nothing and preserve storage", () => {
+  const f = fixture();
+  for (const caller of [f.config.agent_id, "stranger.near"]) {
+    f.caller(caller);
+    rejectsWithoutPolicyEffects(f, () => setPolicy(f.host, f.config, f.policy), /owner_only/);
+    rejectsWithoutPolicyEffects(f, () => disablePolicy(f.host, f.config, f.policy.token_id), /owner_only/);
+    rejectsWithoutPolicyEffects(f, () => cancelPolicy(f.host, f.config), /owner_or_guardian_only/);
+  }
+  f.caller(f.config.owner_id);
+  rejectsWithoutPolicyEffects(f, () => setPolicy(f.host, f.config, { ...f.policy, daily_limit: "1" }), /cap_exceeds_daily_limit/);
+  rejectsWithoutPolicyEffects(f, () => disablePolicy(f.host, f.config, "bad token"), /bad_account_id/);
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" });
+  const pending = getPendingPolicy(f.host)!;
+  f.deposit(1n);
+  for (const action of [() => setPolicy(f.host, f.config, f.policy), () => cancelPolicy(f.host, f.config),
+    () => disablePolicy(f.host, f.config, f.policy.token_id), () => activatePolicy(f.host, pending.proposal_id)]) {
+    rejectsWithoutPolicyEffects(f, action, /zero_deposit_required/);
+  }
+  f.deposit(0n); f.caller(f.config.guardian_id); proposeOwnerRecovery(f.host, f.config, "next.near");
+  f.caller(f.config.owner_id);
+  rejectsWithoutPolicyEffects(f, () => setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" }), /recovery_pending/);
+  rejectsWithoutPolicyEffects(f, () => activatePolicy(f.host, pending.proposal_id), /recovery_pending/);
+});
+
+test("policy events: pure loosening emits only a proposal; failed final writes emit no success", () => {
+  const f = fixture(); f.caller(f.config.owner_id);
+  const start = f.logs.length;
+  setPolicy(f.host, f.config, { ...f.policy, max_per_payment: "60000000" });
+  assert.equal(f.logs.length, start + 1);
+  policyEvent(f, "policy_proposed", getPendingPolicy(f.host)!);
+  const pending = getPendingPolicy(f.host)!;
+  f.time(BigInt(pending.activate_after));
+  const failingHost: Host = { ...f.host, write: (key, value) => {
+    if (key === "pending_policy" && value === "null") throw new Error("storage_failure");
+    f.host.write(key, value);
+  } };
+  const count = f.logs.length;
+  // NEAR rolls back storage when a receipt fails; this host checks log ordering.
+  assert.throws(() => activatePolicy(failingHost, pending.proposal_id), /storage_failure/);
+  assert.equal(f.logs.length, count);
+});

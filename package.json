@@ -5,7 +5,9 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "npm run test:reference && npm run test:contract",
+    "test": "npm run test:reference && npm run test:contract && npm run test:deployment",
+    "test:deployment": "node --test tests/deploy-testnet.test.mjs",
+    "deploy:testnet": "node scripts/deploy-testnet.mjs",
     "test:reference": "node --experimental-strip-types src/checkPayment.test.ts",
     "test:contract": "node --experimental-strip-types tests/policy.test.ts",
     "check": "tsc --noEmit",
