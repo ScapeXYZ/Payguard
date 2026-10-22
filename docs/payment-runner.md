@@ -135,6 +135,15 @@ and the token's transfer semantics; it is not independent balance reconciliation
   registration, balances, guard code hash or eventual gas sufficiency. The contract
   remains authoritative. No public-network payment was used to validate this runner.
 
+## Read-only payment evidence export
+
+Use `npm run evidence:export -- --journal /absolute/journal --output
+/absolute/existing-directory/payment-evidence.json` to produce an offline,
+allowlisted JSON snapshot without credentials, journal writes or RPC calls.
+See [EVIDENCE_FORMAT.md](EVIDENCE_FORMAT.md) for the proposed frontend contract,
+status rules, empty states, safe output behavior and verification limitations.
+Runner success alone does not establish exported settlement.
+
 ## Tests
 
 ```sh
