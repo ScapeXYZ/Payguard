@@ -39,7 +39,7 @@ export type EvidenceRecord = {
   verified_at: string | null;             // ISO, persisted receipt observation time
   recipient_balance_before: string | null;
   recipient_balance_after: string | null;
-  note: string | null;
+  note: string;
 };
 
 export type EvidenceFile = {
@@ -68,6 +68,34 @@ const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k)
 // composite (network, guard, request_id) of the file it came from.
 export const evidenceKey = (f: Pick<EvidenceFile, "network" | "guard_id">, r: Pick<EvidenceRecord, "request_id">) =>
   `${f.network}/${f.guard_id}/${r.request_id}`;
+
+export const explorerUrlFor = (network: string, hash: string) => `https://${network === "testnet" ? "testnet." : ""}nearblocks.io/txns/${hash}`;
+const ALWAYS_NULL_FROM_JOURNAL = ["scenario", "token_symbol", "token_decimals", "block_height", "block_timestamp_ns",
+  "recipient_balance_before", "recipient_balance_after", "policy_id", "proposal_id"] as const;
+
+// Which nulls are legal is decided by where the exporter (scripts/export-payment-evidence.mjs @ 9ebcb5d) can emit them.
+// A null in a place the exporter never emits one means the file is wrong, not "Unknown".
+export function typedNullRule(r: EvidenceRecord, network: string): string | null {
+  // l29: classification only runs when tx_hash is set, so only pending can have null tx_hash.
+  if (r.tx_hash === null && r.status !== "pending") return `${r.status} requires tx_hash (the exporter only classifies with a hash, l29)`;
+  // l67: explorer_url is null exactly when tx_hash is null, otherwise derived from it.
+  if (r.tx_hash === null ? r.explorer_url !== null : r.explorer_url !== explorerUrlFor(network, r.tx_hash)) return "explorer_url must be null iff tx_hash is null, else the NearBlocks URL of tx_hash (l67)";
+  // l56-58: settlement_receipt_id is set only for settled, and settled requires it.
+  if (r.status === "settled" ? r.settlement_receipt_id === null : r.settlement_receipt_id !== null) return "settlement_receipt_id is required for settled and must be null otherwise (l56-58)";
+  // l62: verified_at is only set once a record is classified; pending is always null (non-pending may be null, l64).
+  if (r.status === "pending" && r.verified_at !== null) return "pending records must have verified_at null (l62)";
+  // l37/l54: reason is set only by rejected and settlement_failed.
+  if ((r.status === "pending" || r.status === "reserved" || r.status === "settled") && r.reason !== null) return `${r.status} must have reason null (l37, l54)`;
+  if (r.status === "settlement_failed" && r.reason !== "ft_transfer_failed") return "settlement_failed requires reason ft_transfer_failed (l54)";
+  if (r.status === "rejected" && r.reason === null) return "rejected requires reason (l37)";
+  if (r.source === "runner_journal") {
+    // l21-22: these start null and are never assigned; his test l129/l133/l164 asserts they stay null.
+    const set = ALWAYS_NULL_FROM_JOURNAL.filter((k) => r[k] !== null);
+    if (set.length) return `runner_journal never emits ${set.join(", ")} (always null, l21-22)`;
+    if (r.status === "rejected" && r.reason !== GENERIC_GUARD_FAILURE) return "runner_journal rejected reason must be guard_execution_failed (l37)";
+  }
+  return null;
+}
 
 // Strict check. One bad record rejects the file: partial evidence is worse than none.
 export function parseEvidence(raw: unknown, guardId: string, network: string = NETWORK): { ok: true; file: EvidenceFile } | { ok: false; error: string } {
@@ -105,9 +133,9 @@ export function parseEvidence(raw: unknown, guardId: string, network: string = N
     if (!nullOr(r.proposal_id, digits)) return bad("proposal_id must be a decimal string or null");
     if (!nullOr(r.verified_at, iso)) return bad("verified_at must be ISO 8601 or null");
     if (!nullOr(r.recipient_balance_before, digits) || !nullOr(r.recipient_balance_after, digits)) return bad("balances must be decimal strings or null");
-    if (!nullOr(r.note, (x) => typeof x === "string")) return bad("note must be a string or null");
-    if (r.status === "settled" && (!r.settlement_receipt_id || !r.tx_hash)) return bad("settled requires tx_hash and settlement_receipt_id (a guard success alone is never settlement)");
-    if (r.status === "rejected" && !r.reason) return bad("rejected requires reason");
+    if (typeof r.note !== "string") return bad("note must be a string");
+    const why = typedNullRule(r, f.network);
+    if (why) return bad(why);
   }
   return { ok: true, file: f };
 }
@@ -117,7 +145,7 @@ export type Verification =
   | { state: "mismatch"; onchain: PaymentStatus; reason: string | null; chainCode: string | null; settlementReceiptId: string | null; detail: string }
   | { state: "unverifiable"; why: string };
 
-type Settlement = { receiptId: string; result: "settled" | "failed" | "reserved" | "pending"; message: string | null };
+type Settlement = { receiptId: string; result: "settled" | "failed" | "reserved"; message: string | null };
 
 const decodeArgs = (b64: string): Record<string, unknown> | null => {
   try { return JSON.parse(typeof atob === "function" ? atob(b64) : Buffer.from(b64, "base64").toString("utf8")); } catch { return null; }
@@ -131,7 +159,9 @@ const isObj = (s: unknown): s is Record<string, unknown> => typeof s === "object
 export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" | "recipient_id" | "amount">, guardId: string): Settlement | null {
   const roots = tx.transaction_outcome.outcome.receipt_ids;
   const guardOut = tx.receipts_outcome.find((o) => roots.includes(o.id) && o.outcome.executor_id === guardId);
-  if (!guardOut) return null;
+  // exporter l38-40: only a successful guard receipt can carry the transfer
+  const gs = guardOut?.outcome.status;
+  if (!guardOut || !(isObj(gs) && ("SuccessValue" in gs || "SuccessReceiptId" in gs))) return null;
   const match = (tx.receipts ?? []).find((x: TxReceipt) => {
     if (!guardOut.outcome.receipt_ids.includes(x.receipt_id) || x.predecessor_id !== guardId || x.receiver_id !== r.token_id) return false;
     const acts = (x.receipt as { Action?: { actions: unknown[] } }).Action?.actions;
@@ -146,8 +176,8 @@ export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" 
   const s = out?.outcome.status;
   if (isObj(s) && "Failure" in s) return { receiptId: match.receipt_id, result: "failed", message: describeFailure(s.Failure) };
   if (isObj(s) && "SuccessValue" in s && out!.outcome.receipt_ids.length === 0) return { receiptId: match.receipt_id, result: "settled", message: null };
-  if (isObj(s) && ("SuccessValue" in s || "SuccessReceiptId" in s)) return { receiptId: match.receipt_id, result: "reserved", message: null };
-  return { receiptId: match.receipt_id, result: "pending", message: null };
+  // exporter l51: a matched ft_transfer with any other / missing outcome stays reserved
+  return { receiptId: match.receipt_id, result: "reserved", message: null };
 }
 
 // Pure: re-derive the payment status from an RPC result and compare with the record.
@@ -164,12 +194,11 @@ export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string
     onchain = "rejected"; chainCode = o.failure?.code ?? o.failure?.message ?? null; guardFailed = o.failure?.executor === guardId;
   } else {
     st = findSettlement(tx, r, guardId);
-    if (o.status === "pending") onchain = "pending";
-    else if (!st) onchain = "reserved";
-    else if (st.result === "failed") { onchain = "settlement_failed"; chainCode = st.message; }
-    else if (st.result === "settled") onchain = "settled";
-    else if (st.result === "reserved") onchain = "reserved";
-    else onchain = "pending";
+    if (st?.result === "failed") { onchain = "settlement_failed"; chainCode = st.message; }
+    else if (st?.result === "settled") onchain = "settled";
+    else if (st) onchain = "reserved";          // transfer issued, completion unverified
+    else if (o.status === "pending") onchain = "pending";
+    else onchain = "reserved";                  // guard succeeded, no matching transfer found
   }
   const sid = st?.receiptId ?? null;
   const base = { onchain, reason: r.reason, chainCode, settlementReceiptId: sid };
