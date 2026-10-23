@@ -66,7 +66,7 @@ function ScenarioCard({ s, file, records, verified }: { s: (typeof SCENARIOS)[nu
   const kOf = (r: EvidenceRecord) => (file ? evidenceKey(file, r) : r.request_id);
   // The deciding record: for D the last one (the payment that tipped over the limit).
   const key = s.id === "D" ? records.filter((r) => r.status === "rejected").at(-1) ?? records.at(-1) : records.at(-1);
-  const v = key ? verified[kOf(key)] : undefined;
+  const v = key ? verified(key) : undefined;  // only a result for exactly this record's content
   const matchesExpectation = key && v?.state === "verified" && v.onchain === s.expect && (s.expect !== "rejected" || v.chainCode === s.code);
   const tone = !key ? "border-dashed" : matchesExpectation ? (s.expect === "settled" ? "border-emerald-500/40" : "border-red-500/40") : "border-amber-500/40";
   return (
@@ -89,9 +89,9 @@ function ScenarioCard({ s, file, records, verified }: { s: (typeof SCENARIOS)[nu
               <div key={kOf(r)} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-2">
                 <span className="font-mono text-xs">{r.request_id} · {fmtEvidenceAmount(r.amount, r)} → {r.recipient_id}</span>
                 <span className="flex flex-wrap items-center gap-2">
-                  <Badge variant={STATUS_COPY[r.status].tone}>{reasonText(r.reason) ?? STATUS_COPY[r.status].label}</Badge>
-                  <VerifyBadge v={verified[kOf(r)]} status={r.status} />
-                  <VerifyDetail v={verified[kOf(r)]} />
+                  <Badge variant={STATUS_COPY[r.status].tone}>{r.reason ? `runner reports: ${reasonText(r.reason)}` : STATUS_COPY[r.status].label}</Badge>
+                  <VerifyBadge v={verified(r)} status={r.status} />
+                  <VerifyDetail v={verified(r)} />
                   {r.tx_hash && <a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">tx <ExternalLink className="size-3" /></a>}
                 </span>
               </div>
@@ -101,7 +101,9 @@ function ScenarioCard({ s, file, records, verified }: { s: (typeof SCENARIOS)[nu
             )}
             <div className={cn("flex items-center gap-2 font-medium", matchesExpectation ? (s.expect === "settled" ? "text-emerald-400" : "text-red-300") : "text-amber-300")}>
               {matchesExpectation ? (s.expect === "settled" ? <CheckCircle2 className="size-4" /> : <ShieldX className="size-4" />) : <Hourglass className="size-4" />}
-              {matchesExpectation ? (s.expect === "settled" ? "Paid, verified on chain." : "Blocked by the contract, verified on chain.") : v ? "Evidence doesn't match the expected outcome yet." : "Checking the chain..."}
+              {matchesExpectation ? (s.expect === "settled" ? "Paid: the pay call settled, verified on chain." : `Blocked: the pay call failed with ${s.code}, verified on chain.`) : v ? `Runner reports ${reasonText(key.reason) ?? key.status}; not verified on chain as the expected outcome.` : "Checking the chain..."}
+            </div>
+            <div className="text-xs text-muted-foreground">Scenario tag {s.id} is reported by the runner; the chain proves the outcome of this pay call, not the intent behind it.
             </div>
           </div>
         )}

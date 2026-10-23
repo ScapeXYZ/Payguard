@@ -22,6 +22,8 @@ export function parseUnits(input: string, decimals: number): ParseResult {
 
 // Full precision, trailing zeros trimmed: "12500000" (6) -> "12.5". Never cuts digits.
 export function formatUnits(raw: string, decimals: number): string {
+  // Bounded exponent: a negative or huge decimals value would throw or hang in 10n ** n.
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 38) throw new RangeError(`unsupported token decimals: ${decimals}`);
   let v: bigint;
   try { v = BigInt(raw); } catch { return raw; }
   const neg = v < 0n;

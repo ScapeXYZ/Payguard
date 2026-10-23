@@ -6,6 +6,7 @@ import { txUrl } from "@/lib/near-rpc";
 import { guard, IS_MOCK, rolesOf, type Config, type Role } from "@/lib/guard";
 import { useWallet, type WriteCall } from "@/lib/wallet";
 import { useTx, type TxPhase, type TxState } from "@/lib/use-tx";
+import { runThenNotify } from "@/lib/tx-click";
 
 const PHASES: { key: TxPhase; label: string }[] = [
   { key: "awaiting_signature", label: "Awaiting signature" },
@@ -84,7 +85,7 @@ export function TxButton({ call, allowed, config, label, variant = "default", si
         <Button variant="outline" size={size} disabled={!ready} onClick={connect}>Connect wallet to sign</Button>
       ) : (
         <Button variant={variant} size={size} disabled={IS_MOCK || !call || !roleOk || disabled || busy}
-          onClick={async () => { if (call) onDone?.(await run(call)); }}>
+          onClick={() => { void runThenNotify(call, run, onDone); }}>
           {busy ? <Loader2 className="animate-spin" /> : null}{label}
         </Button>
       )}

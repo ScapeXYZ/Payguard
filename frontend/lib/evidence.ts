@@ -6,6 +6,8 @@
 import { NETWORK, txStatus, type TxReceipt, type TxStatus } from "./near-rpc";
 import { classifyTx } from "./tx-outcome";
 import { contractErrorCode, describeFailure } from "./errors";
+import { bindPayCall } from "./pay-binding";
+import { duplicateTxHash, isDecimal, isTimestampNs } from "./evidence-view";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
 export const EVIDENCE_URL = process.env.NEXT_PUBLIC_EVIDENCE_URL ?? "";
@@ -61,6 +63,7 @@ const iso = (v: unknown) => str(v) && !Number.isNaN(Date.parse(v));
 const digits = (v: unknown) => typeof v === "string" && /^[0-9]+$/.test(v);
 const b58 = (v: unknown) => typeof v === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
 const nullOr = (v: unknown, ok: (x: unknown) => boolean) => v === null || ok(v);
+const acct = (v: unknown) => typeof v === "string" && v.length >= 2 && v.length <= 64 && /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(v);
 const u128 = (v: unknown) => typeof v === "string" && /^[1-9][0-9]{0,38}$/.test(v) && BigInt(v) < 2n ** 128n;
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -116,27 +119,29 @@ export function parseEvidence(raw: unknown, guardId: string, network: string = N
     if (!str(r.request_id) || !/^[A-Za-z0-9_-]{1,64}$/.test(r.request_id)) return bad("request_id invalid");
     if (seen.has(r.request_id)) return bad("duplicate request_id in this export");
     seen.add(r.request_id);
-    if (!str(r.agent_id) || !str(r.recipient_id) || !str(r.token_id)) return bad("agent_id, recipient_id and token_id are required");
+    if (!acct(r.agent_id) || !acct(r.recipient_id) || !acct(r.token_id)) return bad("agent_id, recipient_id and token_id must be NEAR account ids");
     if (!u128(r.amount)) return bad("amount must be a canonical positive u128 base-unit string");
     if (!STATUSES.includes(r.status)) return bad(`status must be one of ${STATUSES.join(", ")}`);
     if (!str(r.source)) return bad("source is required");
     if (!nullOr(r.scenario, (x) => ["A", "B", "C", "D", "E"].includes(x as string))) return bad("scenario must be A-E or null");
-    if (!nullOr(r.token_symbol, (x) => typeof x === "string")) return bad("token_symbol must be a string or null");
+    if (!nullOr(r.token_symbol, (x) => typeof x === "string" && x.length <= 32)) return bad("token_symbol must be a string (max 32) or null");
     if (!nullOr(r.token_decimals, (x) => Number.isInteger(x) && (x as number) >= 0 && (x as number) <= 38)) return bad("token_decimals must be an integer 0-38 or null");
     if (!nullOr(r.reason, str)) return bad("reason must be a string or null");
     if (!nullOr(r.tx_hash, b58)) return bad("tx_hash must be a base58 hash or null");
     if (!nullOr(r.block_height, (x) => Number.isInteger(x) && (x as number) >= 0)) return bad("block_height must be an integer or null");
-    if (!nullOr(r.block_timestamp_ns, digits)) return bad("block_timestamp_ns must be a decimal string or null");
+    if (!nullOr(r.block_timestamp_ns, isTimestampNs)) return bad("block_timestamp_ns must be a bounded decimal string or null");
     if (!nullOr(r.explorer_url, (x) => typeof x === "string")) return bad("explorer_url must be a string or null");
     if (!nullOr(r.settlement_receipt_id, b58)) return bad("settlement_receipt_id must be a base58 id or null");
     if (!nullOr(r.policy_id, (x) => typeof x === "string")) return bad("policy_id must be a string or null");
     if (!nullOr(r.proposal_id, digits)) return bad("proposal_id must be a decimal string or null");
     if (!nullOr(r.verified_at, iso)) return bad("verified_at must be ISO 8601 or null");
-    if (!nullOr(r.recipient_balance_before, digits) || !nullOr(r.recipient_balance_after, digits)) return bad("balances must be decimal strings or null");
+    if (!nullOr(r.recipient_balance_before, isDecimal) || !nullOr(r.recipient_balance_after, isDecimal)) return bad("balances must be canonical decimal strings or null");
     if (typeof r.note !== "string") return bad("note must be a string");
     const why = typedNullRule(r, f.network);
     if (why) return bad(why);
   }
+  const dup = duplicateTxHash(f.records);
+  if (dup) return { ok: false, error: `tx_hash ${dup} appears in more than one record; one chain result can't vouch for two rows` };
   return { ok: true, file: f };
 }
 
@@ -191,9 +196,10 @@ export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" 
 
 // Pure: re-derive the payment status from an RPC result and compare with the record.
 // A null tx_hash or a null verified_at is never verified evidence, even if the chain matches.
-export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string): Verification {
+// agentId = the guard's configured agent (get_config), never taken from the record.
+export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string, agentId: string | null | undefined): Verification {
   if (!r.tx_hash) return { state: "unavailable", why: NO_HASH, chain: null };
-  const v = checkChain(r, tx, guardId);
+  const v = checkChain(r, tx, guardId, agentId);
   if (r.verified_at !== null) return v;
   if (v.state === "verified") { const { state: _s, ...c } = v; return { state: "unavailable", why: NO_VERIFIED_AT, chain: { ...c, agrees: true, detail: null } }; }
   if (v.state === "mismatch") { const { state: _s, detail, ...c } = v; return { state: "unavailable", why: NO_VERIFIED_AT, chain: { ...c, agrees: false, detail } }; }
@@ -208,10 +214,10 @@ function guardReceiptFailure(tx: TxStatus, guardId: string): { code: string | nu
   return { code: contractErrorCode(f), text: describeFailure(f) };
 }
 
-function checkChain(r: EvidenceRecord, tx: TxStatus, guardId: string): Verification {
-  if (tx.transaction.hash !== r.tx_hash) return { state: "unverifiable", why: "RPC returned a different transaction" };
-  if (tx.transaction.receiver_id !== guardId) return { state: "unverifiable", why: `tx was sent to ${tx.transaction.receiver_id}, not the guard` };
-  if (tx.transaction.signer_id !== r.agent_id) return { state: "unverifiable", why: `tx was signed by ${tx.transaction.signer_id}, not ${r.agent_id}` };
+function checkChain(r: EvidenceRecord, tx: TxStatus, guardId: string, agentId: string | null | undefined): Verification {
+  // Review F3: the tx must be exactly the configured agent's pay call for THIS request/token/recipient/amount.
+  const bind = bindPayCall(tx, { ...r, tx_hash: r.tx_hash ?? "" }, guardId, agentId);
+  if (!bind.ok) return { state: "unverifiable", why: bind.why };
   if (r.status === "settled" && !r.settlement_receipt_id) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
 
   const o = classifyTx(tx, guardId);
@@ -243,15 +249,19 @@ function checkChain(r: EvidenceRecord, tx: TxStatus, guardId: string): Verificat
   return { state: "verified", ...base };
 }
 
-export async function verifyRecord(r: EvidenceRecord, guardId: string): Promise<Verification> {
+export async function verifyRecord(r: EvidenceRecord, guardId: string, agentId: string | null | undefined): Promise<Verification> {
   if (!r.tx_hash) return { state: "unavailable", why: NO_HASH, chain: null };
+  if (!agentId) {
+    const why = "the guard's configured agent is unknown, so the signer can't be checked";
+    return r.verified_at === null ? { state: "unavailable", why: `${NO_VERIFIED_AT}; ${why}`, chain: null } : { state: "unverifiable", why };
+  }
   let tx;
   try { tx = await txStatus(r.tx_hash, r.agent_id, "FINAL"); }
   catch (e) {
     const why = `RPC couldn't load the tx (${String((e as Error)?.message ?? e)}); older txs need an archival RPC`;
     return r.verified_at === null ? { state: "unavailable", why: `${NO_VERIFIED_AT}; ${why}`, chain: null } : { state: "unverifiable", why };
   }
-  return verifyAgainstTx(r, tx, guardId);
+  return verifyAgainstTx(r, tx, guardId, agentId);
 }
 
 // Fetch failure, invalid JSON, wrong schema/network/guard = a data error, never an empty history.
