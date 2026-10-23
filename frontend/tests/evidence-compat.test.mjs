@@ -255,13 +255,13 @@ test('archival fallback repeats the complete read-only verification on one provi
   const mock = readRpc(tx);
   globalThis.fetch = async (url, init) => {
     const request = JSON.parse(init.body); calls.push({ url, method: request.method });
-    if (url === 'https://primary.invalid' && request.method === 'EXPERIMENTAL_receipt') return { ok: false, status: 503 };
+    if (new URL(url).hostname === 'primary.invalid' && request.method === 'EXPERIMENTAL_receipt') return { ok: false, status: 503 };
     return { ok: true, json: async () => ({ jsonrpc: '2.0', id: request.id, result: await mock(request.method, request.params) }) };
   };
   try {
     assert.ok(green(await verifyRecord(record(), guard, agent)));
     assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status', 'EXPERIMENTAL_receipt', 'status', 'tx_status', 'EXPERIMENTAL_receipt', 'EXPERIMENTAL_receipt', 'EXPERIMENTAL_receipt']);
-    assert.ok(calls.slice(3).every(c => c.url === 'https://archive.invalid'));
+    assert.ok(calls.slice(3).every(c => new URL(c.url).hostname === 'archive.invalid'));
   } finally { globalThis.fetch = previous; }
 });
 test('contradictory primary evidence is never silently replaced by archival evidence', async () => {
@@ -273,7 +273,7 @@ test('contradictory primary evidence is never silently replaced by archival evid
   };
   try {
     assert.equal(green(await verifyRecord(record(), guard, agent)), false);
-    assert.ok(calls.every(url => url === 'https://primary.invalid'));
+    assert.ok(calls.every(url => new URL(url).hostname === 'primary.invalid'));
   } finally { globalThis.fetch = previous; }
 });
 test('feed fetch failure and malformed JSON are data errors, not empty exports', async () => {
@@ -283,5 +283,22 @@ test('feed fetch failure and malformed JSON are data errors, not empty exports',
     globalThis.fetch = async () => ({ ok: true, json: async () => { throw Error('invalid JSON'); } }); await assert.rejects(loadEvidence(guard));
     globalThis.fetch = async () => ({ ok: true, json: async () => envelope([record()]) });
     assert.equal((await loadEvidence(guard)).records.length, 1);
+  } finally { globalThis.fetch = previous; }
+});
+
+for (const fault of ['wrong response ID', 'wrong JSON-RPC version', 'missing result', 'error and result', 'invalid JSON']) test(`production evidence transport refuses ${fault} without green or silent fallback`, async () => {
+  const previous = globalThis.fetch, calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(url); const request = JSON.parse(init.body);
+    const body = { jsonrpc: '2.0', id: request.id, result: { chain_id: 'testnet' } };
+    if (fault === 'wrong response ID') body.id = 'unrelated';
+    if (fault === 'wrong JSON-RPC version') body.jsonrpc = '1.0';
+    if (fault === 'missing result') delete body.result;
+    if (fault === 'error and result') body.error = { code: -32000 };
+    return { ok: true, json: async () => { if (fault === 'invalid JSON') throw Error('invalid JSON'); return body; } };
+  };
+  try {
+    assert.equal(green(await verifyRecord(record(), guard, agent)), false);
+    assert.equal(calls.length, 1);
   } finally { globalThis.fetch = previous; }
 });

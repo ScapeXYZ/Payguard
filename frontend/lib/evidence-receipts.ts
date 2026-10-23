@@ -1,5 +1,5 @@
 // Read-only evidence verification. No wallet, runner, keys or journal access.
-import { ARCHIVAL_RPC_URL, NETWORK, RPC_URL, RpcError, rpc, type TxReceipt, type TxStatus } from "./near-rpc";
+import { ARCHIVAL_RPC_URL, NETWORK, RPC_URL, RpcError, type TxReceipt, type TxStatus } from "./near-rpc";
 
 export type EvidenceIdentity = { hash: string; signerId: string; guardId: string };
 export type EvidenceRead = (method: "status" | "tx_status" | "EXPERIMENTAL_receipt", params: Record<string, unknown>) => Promise<unknown>;
@@ -8,6 +8,31 @@ const object = (v: unknown): v is Record<string, unknown> => v !== null && typeo
 const terminal = (s: unknown) => object(s) && Object.keys(s).length === 1 &&
   ((typeof s.SuccessValue === "string") || hash(s.SuccessReceiptId) || ("Failure" in s && object(s.Failure)));
 const fail = (): never => { throw new Error("Incomplete or contradictory finalized receipt evidence"); };
+
+// Keep evidence transport as strict as main's evidenceRpc, without changing the
+// general wallet/view RPC client. Malformed envelopes never trigger a success or
+// a silent fallback; only explicit transport/RPC failures may try archival RPC.
+export function evidenceRead(endpoint: string): EvidenceRead {
+  const url = new URL(endpoint);
+  if (url.protocol !== "https:" || url.username || url.password || url.hash) fail();
+  return async (method, params) => {
+    if (!["status", "tx_status", "EXPERIMENTAL_receipt"].includes(method)) fail();
+    let response: Response;
+    try {
+      response = await fetch(url.href, { method: "POST", redirect: "error",
+        headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ jsonrpc: "2.0", id: "payguard-evidence", method, params }) });
+    } catch { throw new RpcError("Evidence RPC unavailable", "network"); }
+    if (!response.ok) throw new RpcError("Evidence RPC returned an HTTP error", "network");
+    let body: unknown;
+    try { body = await response.json(); } catch { return fail(); }
+    if (!object(body) || body.jsonrpc !== "2.0" || body.id !== "payguard-evidence" ||
+        ("error" in body && "result" in body)) return fail();
+    if (body.error) throw new RpcError("Evidence RPC rejected the lookup", "rpc");
+    if (!body.result) return fail();
+    return body.result;
+  };
+}
 
 // Validate before projecting a status or fetching bodies. FINAL without all linked
 // terminal outcomes is insufficient. Duplicate IDs, cycles and unrelated outcomes
@@ -89,7 +114,7 @@ export async function enrichEvidenceTransaction(id: EvidenceIdentity, read: Evid
 }
 
 export async function loadEvidenceTransaction(id: EvidenceIdentity): Promise<TxStatus> {
-  const from = (url: string) => enrichEvidenceTransaction(id, (method, params) => rpc(method, params, url, 30_000));
+  const from = (url: string) => enrichEvidenceTransaction(id, evidenceRead(url));
   try { return await from(RPC_URL); }
   catch (error) {
     // Repeat the ENTIRE lookup/enrichment against archival RPC; do not mix providers.
