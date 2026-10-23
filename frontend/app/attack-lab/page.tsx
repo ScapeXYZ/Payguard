@@ -2,12 +2,11 @@
 import { CheckCircle2, ExternalLink, FileJson, FlaskConical, Hourglass, ShieldX } from "lucide-react";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle, Mono } from "@/components/ui";
 import { ViewBanner } from "@/components/view-state";
-import { STATUS_COPY, VerifyBadge, VerifyDetail, useVerified } from "@/components/payment-history";
+import { STATUS_COPY, VerifyBadge, VerifyDetail, fmtEvidenceAmount, reasonText, useVerified } from "@/components/payment-history";
 import { guard, IS_MOCK, TOKENS } from "@/lib/guard";
 import { useView } from "@/lib/use-guard";
 import { useToken } from "@/lib/use-token";
-import { EVIDENCE_URL, evidenceKey, loadEvidence, type EvidenceRecord, type Scenario } from "@/lib/evidence";
-import { fmtEvidenceAmount } from "@/lib/evidence-view";
+import { EMPTY_EVIDENCE_TEXT, EVIDENCE_URL, evidenceKey, loadEvidence, type EvidenceFile, type EvidenceRecord, type Scenario } from "@/lib/evidence";
 import { CONTRACT_ERRORS } from "@/lib/errors";
 import { txUrl } from "@/lib/near-rpc";
 import { cn } from "@/lib/utils";
@@ -44,7 +43,9 @@ export default function AttackLab() {
         </CardContent>
       </Card>
 
-      {EVIDENCE_URL && !IS_MOCK && <ViewBanner views={[ev]} what="evidence feed" />}
+      {EVIDENCE_URL && !IS_MOCK && <ViewBanner views={[ev]} what="evidence feed" from="the evidence feed" />}
+      {ev.data && !ev.data.records.length && <p className="text-sm text-muted-foreground">{EMPTY_EVIDENCE_TEXT}. An empty export doesn&apos;t prove there were no on-chain payments.</p>}
+      {ev.data && ev.data.records.length > 0 && !ev.data.records.some((r) => r.scenario) && <p className="text-sm text-muted-foreground">The evidence has payments but none is tagged with a scenario, so no Attack Lab result is claimed from it.</p>}
 
       <Card>
         <CardHeader><CardTitle className="text-base">Rules in force right now</CardTitle><CardDescription>Live from the guard, so you can check each verdict against them.</CardDescription></CardHeader>
@@ -55,17 +56,18 @@ export default function AttackLab() {
       </Card>
 
       <div className="grid gap-4 md:grid-cols-2">
-        {SCENARIOS.map((s) => <ScenarioCard key={s.id} s={s} keyOf={(r) => evidenceKey(ev.data!, r)} records={records.filter((r) => r.scenario === s.id)} verified={verified} />)}
+        {SCENARIOS.map((s) => <ScenarioCard key={s.id} s={s} file={ev.data ?? null} records={records.filter((r) => r.scenario === s.id)} verified={verified} />)}
       </div>
     </div>
   );
 }
 
-function ScenarioCard({ s, keyOf, records, verified }: { s: (typeof SCENARIOS)[number]; keyOf: (r: EvidenceRecord) => string; records: EvidenceRecord[]; verified: ReturnType<typeof useVerified> }) {
+function ScenarioCard({ s, file, records, verified }: { s: (typeof SCENARIOS)[number]; file: EvidenceFile | null; records: EvidenceRecord[]; verified: ReturnType<typeof useVerified> }) {
+  const kOf = (r: EvidenceRecord) => (file ? evidenceKey(file, r) : r.request_id);
   // The deciding record: for D the last one (the payment that tipped over the limit).
   const key = s.id === "D" ? records.filter((r) => r.status === "rejected").at(-1) ?? records.at(-1) : records.at(-1);
   const v = key ? verified(key) : undefined;  // only a result for exactly this record's content
-  const matchesExpectation = key && v?.state === "verified" && v.onchain === s.expect && (s.expect !== "rejected" || v.reason === s.code);
+  const matchesExpectation = key && v?.state === "verified" && v.onchain === s.expect && (s.expect !== "rejected" || v.chainCode === s.code);
   const tone = !key ? "border-dashed" : matchesExpectation ? (s.expect === "settled" ? "border-emerald-500/40" : "border-red-500/40") : "border-amber-500/40";
   return (
     <Card className={cn(tone)}>
@@ -84,22 +86,22 @@ function ScenarioCard({ s, keyOf, records, verified }: { s: (typeof SCENARIOS)[n
         ) : (
           <div className="space-y-2">
             {records.map((r) => (
-              <div key={keyOf(r)} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-2">
-                <span className="font-mono text-xs">{r.request_id} · {fmtEvidenceAmount(r.amount, r.token_decimals, r.token_symbol)} → {r.recipient_id}</span>
+              <div key={kOf(r)} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-2">
+                <span className="font-mono text-xs">{r.request_id} · {fmtEvidenceAmount(r.amount, r)} → {r.recipient_id}</span>
                 <span className="flex flex-wrap items-center gap-2">
-                  <Badge variant={STATUS_COPY[r.status].tone}>{r.reason ? `runner reports: ${r.reason}` : STATUS_COPY[r.status].label}</Badge>
-                  <VerifyBadge v={verified(r)} />
+                  <Badge variant={STATUS_COPY[r.status].tone}>{r.reason ? `runner reports: ${reasonText(r.reason)}` : STATUS_COPY[r.status].label}</Badge>
+                  <VerifyBadge v={verified(r)} status={r.status} />
                   <VerifyDetail v={verified(r)} />
-                  <a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">tx <ExternalLink className="size-3" /></a>
+                  {r.tx_hash && <a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">tx <ExternalLink className="size-3" /></a>}
                 </span>
               </div>
             ))}
             {s.id === "A" && key.recipient_balance_before && key.recipient_balance_after && (
-              <p className="text-xs text-muted-foreground">Merchant balance (reported by the runner): {fmtEvidenceAmount(key.recipient_balance_before, key.token_decimals, key.token_symbol)} → {fmtEvidenceAmount(key.recipient_balance_after, key.token_decimals, key.token_symbol)}</p>
+              <p className="text-xs text-muted-foreground">Merchant balance (reported by the runner): {fmtEvidenceAmount(key.recipient_balance_before, key)} → {fmtEvidenceAmount(key.recipient_balance_after, key)}</p>
             )}
             <div className={cn("flex items-center gap-2 font-medium", matchesExpectation ? (s.expect === "settled" ? "text-emerald-400" : "text-red-300") : "text-amber-300")}>
               {matchesExpectation ? (s.expect === "settled" ? <CheckCircle2 className="size-4" /> : <ShieldX className="size-4" />) : <Hourglass className="size-4" />}
-              {matchesExpectation ? (s.expect === "settled" ? "Paid: the pay call settled, verified on chain." : `Blocked: the pay call failed with ${s.code}, verified on chain.`) : v ? `Runner reports ${key.reason ?? key.status}; not verified on chain as the expected outcome.` : "Checking the chain..."}
+              {matchesExpectation ? (s.expect === "settled" ? "Paid: the pay call settled, verified on chain." : `Blocked: the pay call failed with ${s.code}, verified on chain.`) : v ? `Runner reports ${reasonText(key.reason) ?? key.status}; not verified on chain as the expected outcome.` : "Checking the chain..."}
             </div>
             <div className="text-xs text-muted-foreground">Scenario tag {s.id} is reported by the runner; the chain proves the outcome of this pay call, not the intent behind it.
             </div>

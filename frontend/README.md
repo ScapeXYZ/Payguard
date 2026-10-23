@@ -26,6 +26,16 @@ Next.js (app router) + Tailwind + shadcn/ui, static export.
 - `lib/amount.ts` = exact BigInt base units; over-precise, negative or malformed amounts are refused, never rounded.
 - Payment history and the Attack Lab read the payment runner's evidence feed (`NEXT_PUBLIC_EVIDENCE_URL`, format v2 in `docs/EVIDENCE_FORMAT.md`; settled only with a verified ft_transfer receipt) and re-verify each tx on chain. No feed = an explicit empty state, never sample data.
 
+## Evidence verification
+
+The frontend follows main's `docs/EVIDENCE_FORMAT.md` without changing the exporter. Both `runner_journal` and `runner_journal_rpc` are supported; record provenance must match the envelope. Neither source supplies authoritative token metadata, scenario tags, block data, balances or policy IDs, so these fields remain null. Unknown token metadata displays raw base units. A null transaction hash or observation time never receives a verified badge. A pending record may retain its transaction hash.
+
+Request IDs must be unique within an export. Repeated transaction hashes are accepted, matching the exporter. Each row is checked independently against the configured agent's exact zero-deposit `pay(request_id, token_id, recipient_id, amount)`; a transaction for one request cannot certify another request that reuses its hash. Cached verification is tied to the complete record content and configured agent.
+
+Read-only enrichment uses `status` to check the network, `tx_status` with `wait_until: FINAL`, and `EXPERIMENTAL_receipt` for missing linked bodies. It validates a complete terminal receipt graph, unique IDs and consistent receipt relationships. Archival fallback repeats the whole lookup on one provider, rather than mixing snapshots. Missing or contradictory evidence cannot certify settlement. No wallet or runner is invoked.
+
+Settlement requires the exact linked `ft_transfer` receipt to succeed, with no children except proven terminal system refunds: system predecessor, zero gas price, one positive native Transfer to the agent, and a successful leaf outcome. Arbitrary contract continuations remain reserved. RPC reporting and token semantics are trusted; this is not a balance reconciliation or a cryptographic proof. The one-USDC regression fixture uses synthetic IDs modeled on the independently verified payment structure; it is not live evidence and is never loaded into the application feed.
+
 ## Run
 
 ```
@@ -33,6 +43,6 @@ cd frontend
 npm install
 npm run dev     # local
 npm run build   # static export to out/
-npm test        # offline transaction binding and timeout/retry regression tests
+npm test        # offline transaction safety + evidence compatibility regression tests
 npx tsc --noEmit --incremental false
 ```

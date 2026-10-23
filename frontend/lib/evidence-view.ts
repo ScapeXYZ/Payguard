@@ -42,14 +42,3 @@ export function resultFor<V>(cache: Record<string, Fingerprinted<V>>, key: strin
   const hit = cache[key];
   return hit && hit.fp === fp ? hit.v : undefined;
 }
-
-// Duplicate tx hashes across records are ambiguous: one chain result could vouch for two rows.
-export function duplicateTxHash(records: { tx_hash: string | null }[]): string | null {
-  const seen = new Set<string>();
-  for (const r of records) {
-    if (r.tx_hash === null) continue;
-    if (seen.has(r.tx_hash)) return r.tx_hash;
-    seen.add(r.tx_hash);
-  }
-  return null;
-}
