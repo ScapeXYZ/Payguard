@@ -20,6 +20,20 @@ export type Outcome = {
 const isFailure = (s: ExecStatus): s is { Failure: unknown } => typeof s === "object" && s !== null && "Failure" in s;
 const isSuccess = (s: ExecStatus) => typeof s === "object" && s !== null && ("SuccessValue" in s || "SuccessReceiptId" in s);
 
+// Structural NEAR error kind only, e.g. "ActionError.FunctionCallError.ExecutionError". Walks
+// identifier-shaped keys (and ActionError.kind); never returns a string VALUE, so panic text,
+// policy words and codes from a non-root receipt cannot reach the UI.
+function failureKind(f: unknown): string {
+  const parts: string[] = []; let cur: unknown = f;
+  for (let i = 0; i < 8 && cur !== null && typeof cur === "object" && !Array.isArray(cur); i++) {
+    const o = cur as Record<string, unknown>;
+    const k = Object.keys(o).find((x) => /^[A-Z][A-Za-z0-9]{0,63}$/.test(x));
+    if (k) { parts.push(k); cur = o[k]; } else if ("kind" in o) cur = o.kind; else break;
+  }
+  return parts.length ? parts.join(".") : "unknown error kind";
+}
+export function describeDownstreamFailure(f: unknown): string { return `receipt failed (${failureKind(f)})`; }
+
 export const TX_LEVEL_FAILURE = "The network refused the transaction before the guard contract ran, so no policy decision was made. Check the explorer link.";
 
 function decodeValue(v: string): unknown {
@@ -67,7 +81,9 @@ export function classifyTx(tx: TxStatus, guardId: string): Outcome {
       return { status: "failed", events, downstreamFailures, finality: tx.final_execution_status,
         failure: { code: contractErrorCode(s.Failure), message: describeFailure(s.Failure), receiptId: r.id, executor: r.outcome.executor_id } };
     }
-    downstreamFailures.push({ receiptId: r.id, executor: r.outcome.executor_id, message: describeFailure(s.Failure) });
+    // Review 6adac0622374 R2a: a NON-root receipt never gets policy mapping (no contractErrorCode /
+    // describeFailure): neutral text + the structural error kind only, never its panic text.
+    downstreamFailures.push({ receiptId: r.id, executor: r.outcome.executor_id, message: describeDownstreamFailure(s.Failure) });
   }
   // Guard receipts all succeeded but a downstream receipt (e.g. the token's ft_transfer)
   // failed: the guard's state change IS committed (budget reserved, sweep lock cleared),
