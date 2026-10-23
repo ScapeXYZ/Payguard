@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { Ban, Bot, Check, ChevronLeft, ChevronRight, Clock, FlaskConical, Lock, LogOut, ShieldCheck, ShieldHalf, User, Vault, Wrench } from "lucide-react";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Mono } from "@/components/ui";
@@ -12,6 +12,7 @@ import { useTick, useView } from "@/lib/use-guard";
 import { useToken } from "@/lib/use-token";
 import { useWallet } from "@/lib/wallet";
 import { EVIDENCE_URL, loadEvidence } from "@/lib/evidence";
+import { useVerified } from "@/components/payment-history";
 import { CONTRACT_ERRORS } from "@/lib/errors";
 import { cn, remaining, short } from "@/lib/utils";
 
@@ -36,8 +37,12 @@ function Overview({ config }: { config: Config }) {
   const recovery = useView(() => guard.get_pending_owner_recovery());
   const ev = useView(() => loadEvidence(guard.contractId), []);
   const [showNew, setShowNew] = useState(false);
-  const blocked = ev.data?.records.filter((r) => r.status === "rejected") ?? [];
-  const byReason = blocked.reduce<Record<string, number>>((a, r) => { const k = r.reason ?? "unknown"; a[k] = (a[k] ?? 0) + 1; return a; }, {});
+  const reported = useMemo(() => ev.data?.records.filter((r) => r.status === "rejected"), [ev.data]);
+  const verified = useVerified(ev.data, reported);
+  // Definitive counts only from chain-verified rejections, keyed by the code read from the guard receipt.
+  const confirmed = (reported ?? []).map((r) => verified(r)).filter((v) => v?.state === "verified" && v.onchain === "rejected");
+  const byReason = confirmed.reduce<Record<string, number>>((a, v) => { const k = (v?.state === "verified" && v.reason) || "no code"; a[k] = (a[k] ?? 0) + 1; return a; }, {});
+  const unconfirmed = (reported?.length ?? 0) - confirmed.length;
   const attention = [
     pending.data && { t: `Policy change #${pending.data.proposal_id} pending`, d: remaining(pending.data.activate_after), href: "/payments/" },
     change.data && { t: `${change.data.cold_key_proposed ? "Cold-key guardian" : "Guardian"} change #${change.data.proposal_id} pending`, d: remaining(change.data.activate_after), href: "/guardian/" },
@@ -80,8 +85,11 @@ function Overview({ config }: { config: Config }) {
             {!EVIDENCE_URL || IS_MOCK ? <p className="text-muted-foreground">No evidence feed connected yet, so nothing is claimed here. Rejections will appear once the runner publishes verified records.</p>
               : ev.error && !ev.data ? <p className="text-red-300">Evidence feed unavailable: {ev.error}</p>
               : !ev.data ? <p className="text-muted-foreground">Loading evidence...</p>
-              : blocked.length === 0 ? <p className="text-muted-foreground">No blocked payments in the evidence feed yet.</p>
-              : Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n}</Badge></div>)}
+              : !reported?.length ? <p className="text-muted-foreground">No blocked payments in the evidence feed yet.</p>
+              : <>
+                  {Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n} verified</Badge></div>)}
+                  {unconfirmed > 0 && <p className="text-xs text-muted-foreground">Runner reports {unconfirmed} more rejection{unconfirmed === 1 ? "" : "s"} not (yet) verified on chain; not counted.</p>}
+                </>}
             <Button asChild size="sm" variant="outline"><Link href="/attack-lab/"><FlaskConical /> Attack Lab</Link></Button>
           </CardContent>
         </Card>

@@ -6,9 +6,9 @@ import { STATUS_COPY, VerifyBadge, VerifyDetail, useVerified } from "@/component
 import { guard, IS_MOCK, TOKENS } from "@/lib/guard";
 import { useView } from "@/lib/use-guard";
 import { useToken } from "@/lib/use-token";
-import { EVIDENCE_URL, loadEvidence, type EvidenceRecord, type Scenario } from "@/lib/evidence";
+import { EVIDENCE_URL, evidenceKey, loadEvidence, type EvidenceRecord, type Scenario } from "@/lib/evidence";
+import { fmtEvidenceAmount } from "@/lib/evidence-view";
 import { CONTRACT_ERRORS } from "@/lib/errors";
-import { formatUnits } from "@/lib/amount";
 import { txUrl } from "@/lib/near-rpc";
 import { cn } from "@/lib/utils";
 
@@ -24,7 +24,7 @@ const SCENARIOS: { id: Scenario; title: string; attack: string; expect: "settled
 export default function AttackLab() {
   const ev = useView(() => loadEvidence(guard.contractId), []);
   const records = ev.data?.records ?? [];
-  const verified = useVerified(ev.data?.records);
+  const verified = useVerified(ev.data, ev.data?.records);
   const policy = useView(() => guard.get_policy(TOKENS[0]));
   const token = useToken(TOKENS[0]);
 
@@ -55,16 +55,16 @@ export default function AttackLab() {
       </Card>
 
       <div className="grid gap-4 md:grid-cols-2">
-        {SCENARIOS.map((s) => <ScenarioCard key={s.id} s={s} records={records.filter((r) => r.scenario === s.id)} verified={verified} />)}
+        {SCENARIOS.map((s) => <ScenarioCard key={s.id} s={s} keyOf={(r) => evidenceKey(ev.data!, r)} records={records.filter((r) => r.scenario === s.id)} verified={verified} />)}
       </div>
     </div>
   );
 }
 
-function ScenarioCard({ s, records, verified }: { s: (typeof SCENARIOS)[number]; records: EvidenceRecord[]; verified: ReturnType<typeof useVerified> }) {
+function ScenarioCard({ s, keyOf, records, verified }: { s: (typeof SCENARIOS)[number]; keyOf: (r: EvidenceRecord) => string; records: EvidenceRecord[]; verified: ReturnType<typeof useVerified> }) {
   // The deciding record: for D the last one (the payment that tipped over the limit).
   const key = s.id === "D" ? records.filter((r) => r.status === "rejected").at(-1) ?? records.at(-1) : records.at(-1);
-  const v = key ? verified[key.tx_hash] : undefined;
+  const v = key ? verified(key) : undefined;  // only a result for exactly this record's content
   const matchesExpectation = key && v?.state === "verified" && v.onchain === s.expect && (s.expect !== "rejected" || v.reason === s.code);
   const tone = !key ? "border-dashed" : matchesExpectation ? (s.expect === "settled" ? "border-emerald-500/40" : "border-red-500/40") : "border-amber-500/40";
   return (
@@ -84,22 +84,24 @@ function ScenarioCard({ s, records, verified }: { s: (typeof SCENARIOS)[number];
         ) : (
           <div className="space-y-2">
             {records.map((r) => (
-              <div key={r.tx_hash} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-2">
-                <span className="font-mono text-xs">{r.request_id} · {formatUnits(r.amount, r.token_decimals)} {r.token_symbol} → {r.recipient_id}</span>
+              <div key={keyOf(r)} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-2">
+                <span className="font-mono text-xs">{r.request_id} · {fmtEvidenceAmount(r.amount, r.token_decimals, r.token_symbol)} → {r.recipient_id}</span>
                 <span className="flex flex-wrap items-center gap-2">
-                  <Badge variant={STATUS_COPY[r.status].tone}>{r.reason ?? STATUS_COPY[r.status].label}</Badge>
-                  <VerifyBadge v={verified[r.tx_hash]} />
-                  <VerifyDetail v={verified[r.tx_hash]} />
+                  <Badge variant={STATUS_COPY[r.status].tone}>{r.reason ? `runner reports: ${r.reason}` : STATUS_COPY[r.status].label}</Badge>
+                  <VerifyBadge v={verified(r)} />
+                  <VerifyDetail v={verified(r)} />
                   <a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">tx <ExternalLink className="size-3" /></a>
                 </span>
               </div>
             ))}
             {s.id === "A" && key.recipient_balance_before && key.recipient_balance_after && (
-              <p className="text-xs text-muted-foreground">Merchant balance (reported by the runner): {formatUnits(key.recipient_balance_before, key.token_decimals)} → {formatUnits(key.recipient_balance_after, key.token_decimals)} {key.token_symbol}</p>
+              <p className="text-xs text-muted-foreground">Merchant balance (reported by the runner): {fmtEvidenceAmount(key.recipient_balance_before, key.token_decimals, key.token_symbol)} → {fmtEvidenceAmount(key.recipient_balance_after, key.token_decimals, key.token_symbol)}</p>
             )}
             <div className={cn("flex items-center gap-2 font-medium", matchesExpectation ? (s.expect === "settled" ? "text-emerald-400" : "text-red-300") : "text-amber-300")}>
               {matchesExpectation ? (s.expect === "settled" ? <CheckCircle2 className="size-4" /> : <ShieldX className="size-4" />) : <Hourglass className="size-4" />}
-              {matchesExpectation ? (s.expect === "settled" ? "Paid, verified on chain." : "Blocked by the contract, verified on chain.") : v ? "Evidence doesn't match the expected outcome yet." : "Checking the chain..."}
+              {matchesExpectation ? (s.expect === "settled" ? "Paid: the pay call settled, verified on chain." : `Blocked: the pay call failed with ${s.code}, verified on chain.`) : v ? `Runner reports ${key.reason ?? key.status}; not verified on chain as the expected outcome.` : "Checking the chain..."}
+            </div>
+            <div className="text-xs text-muted-foreground">Scenario tag {s.id} is reported by the runner; the chain proves the outcome of this pay call, not the intent behind it.
             </div>
           </div>
         )}

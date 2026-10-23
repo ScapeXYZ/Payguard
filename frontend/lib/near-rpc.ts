@@ -21,17 +21,26 @@ function b64(s: string) {
 export async function rpc<T>(method: string, params: unknown, url = RPC_URL, timeoutMs = 15_000): Promise<T> {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
-  let res: Response;
+  const timedOut = () => new RpcError(`RPC timed out after ${timeoutMs / 1000}s (${url})`, "network");
+  // The timer stays armed until the body is parsed: a stalled body is a timeout too.
+  let json: { result?: unknown; error?: { data?: string; message?: string } };
   try {
-    res = await fetch(url, {
-      method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: "payguard-ui", method, params }),
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST", signal: ctl.signal, headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "payguard-ui", method, params }),
+      });
+    } catch (e) {
+      throw ctl.signal.aborted ? timedOut() : new RpcError(`RPC unreachable (${url})`, "network", e);
+    }
+    if (!res.ok) throw new RpcError(`RPC returned HTTP ${res.status} (${url})`, "network");
+    const aborted = new Promise<never>((_, rej) => {
+      if (ctl.signal.aborted) rej(timedOut());
+      ctl.signal.addEventListener("abort", () => rej(timedOut()), { once: true });
     });
-  } catch (e) {
-    throw new RpcError(ctl.signal.aborted ? `RPC timed out after ${timeoutMs / 1000}s (${url})` : `RPC unreachable (${url})`, "network", e);
+    json = await Promise.race([res.json().catch(() => { throw ctl.signal.aborted ? timedOut() : new RpcError("RPC returned invalid JSON", "network"); }), aborted]);
   } finally { clearTimeout(t); }
-  if (!res.ok) throw new RpcError(`RPC returned HTTP ${res.status} (${url})`, "network");
-  const json = await res.json().catch(() => { throw new RpcError("RPC returned invalid JSON", "network"); });
   if (json.error) throw new RpcError(json.error.data ?? json.error.message ?? "RPC error", "rpc", json.error);
   return json.result as T;
 }
