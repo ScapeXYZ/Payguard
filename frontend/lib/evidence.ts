@@ -5,7 +5,7 @@
 // A record with no tx_hash can't be re-checked and is always "not verified".
 import { NETWORK, txStatus, type TxReceipt, type TxStatus } from "./near-rpc";
 import { classifyTx } from "./tx-outcome";
-import { describeFailure } from "./errors";
+import { contractErrorCode, describeFailure } from "./errors";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
 export const EVIDENCE_URL = process.env.NEXT_PUBLIC_EVIDENCE_URL ?? "";
@@ -140,10 +140,19 @@ export function parseEvidence(raw: unknown, guardId: string, network: string = N
   return { ok: true, file: f };
 }
 
+// chainCode: a contract code parsed from the actual guard receipt Failure, else null (never a message).
+// chainFailureText: raw failure text from the failing receipt (guard or token), shown labelled, never as a code.
+export type ChainResult = { onchain: PaymentStatus; reason: string | null; chainCode: string | null; chainFailureText: string | null; settlementReceiptId: string | null };
 export type Verification =
-  | { state: "verified"; onchain: PaymentStatus; reason: string | null; chainCode: string | null; settlementReceiptId: string | null }
-  | { state: "mismatch"; onchain: PaymentStatus; reason: string | null; chainCode: string | null; settlementReceiptId: string | null; detail: string }
+  | ({ state: "verified" } & ChainResult)
+  | ({ state: "mismatch"; detail: string } & ChainResult)
+  // Evidence itself is incomplete (null tx_hash or null verified_at): NEVER verified, whatever the chain says.
+  // `chain` is secondary info only ("chain shows X"), null when there was nothing to look up.
+  | { state: "unavailable"; why: string; chain: (ChainResult & { agrees: boolean; detail: string | null }) | null }
   | { state: "unverifiable"; why: string };
+
+const NO_HASH = "the evidence has no transaction hash, so it is not verified evidence";
+const NO_VERIFIED_AT = "the evidence has no verified_at (no persisted classified observation), so it is not verified evidence";
 
 type Settlement = { receiptId: string; result: "settled" | "failed" | "reserved"; message: string | null };
 
@@ -181,34 +190,53 @@ export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" 
 }
 
 // Pure: re-derive the payment status from an RPC result and compare with the record.
+// A null tx_hash or a null verified_at is never verified evidence, even if the chain matches.
 export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string): Verification {
-  if (!r.tx_hash) return { state: "unverifiable", why: "no transaction hash in the evidence, so it can't be checked on chain" };
+  if (!r.tx_hash) return { state: "unavailable", why: NO_HASH, chain: null };
+  const v = checkChain(r, tx, guardId);
+  if (r.verified_at !== null) return v;
+  if (v.state === "verified") { const { state: _s, ...c } = v; return { state: "unavailable", why: NO_VERIFIED_AT, chain: { ...c, agrees: true, detail: null } }; }
+  if (v.state === "mismatch") { const { state: _s, detail, ...c } = v; return { state: "unavailable", why: NO_VERIFIED_AT, chain: { ...c, agrees: false, detail } }; }
+  return v.state === "unverifiable" ? { state: "unavailable", why: `${NO_VERIFIED_AT}; chain lookup also failed: ${v.why}`, chain: null } : v;
+}
+
+// The guard receipt's own Failure (not the tx-level status, not another account's receipt).
+function guardReceiptFailure(tx: TxStatus, guardId: string): { code: string | null; text: string } | null {
+  const g = (tx.receipts_outcome ?? []).find((o) => o.outcome.executor_id === guardId && isObj(o.outcome.status) && "Failure" in o.outcome.status);
+  if (!g) return null;
+  const f = (g.outcome.status as { Failure: unknown }).Failure;
+  return { code: contractErrorCode(f), text: describeFailure(f) };
+}
+
+function checkChain(r: EvidenceRecord, tx: TxStatus, guardId: string): Verification {
   if (tx.transaction.hash !== r.tx_hash) return { state: "unverifiable", why: "RPC returned a different transaction" };
   if (tx.transaction.receiver_id !== guardId) return { state: "unverifiable", why: `tx was sent to ${tx.transaction.receiver_id}, not the guard` };
   if (tx.transaction.signer_id !== r.agent_id) return { state: "unverifiable", why: `tx was signed by ${tx.transaction.signer_id}, not ${r.agent_id}` };
   if (r.status === "settled" && !r.settlement_receipt_id) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
 
   const o = classifyTx(tx, guardId);
-  let onchain: PaymentStatus; let chainCode: string | null = null; let st: Settlement | null = null; let guardFailed = false;
+  let onchain: PaymentStatus; let chainCode: string | null = null; let chainFailureText: string | null = null; let st: Settlement | null = null; let guardFailed = false;
   if (o.status === "failed") {
-    onchain = "rejected"; chainCode = o.failure?.code ?? o.failure?.message ?? null; guardFailed = o.failure?.executor === guardId;
+    // Code ONLY when parsed from the guard receipt's Failure; no guard receipt = no code.
+    const gf = guardReceiptFailure(tx, guardId);
+    onchain = "rejected"; guardFailed = !!gf; chainCode = gf?.code ?? null; chainFailureText = gf && !gf.code ? gf.text : null;
   } else {
     st = findSettlement(tx, r, guardId);
-    if (st?.result === "failed") { onchain = "settlement_failed"; chainCode = st.message; }
+    if (st?.result === "failed") { onchain = "settlement_failed"; chainFailureText = st.message; }
     else if (st?.result === "settled") onchain = "settled";
     else if (st) onchain = "reserved";          // transfer issued, completion unverified
     else if (o.status === "pending") onchain = "pending";
     else onchain = "reserved";                  // guard succeeded, no matching transfer found
   }
   const sid = st?.receiptId ?? null;
-  const base = { onchain, reason: r.reason, chainCode, settlementReceiptId: sid };
+  const base: ChainResult = { onchain, reason: r.reason, chainCode, chainFailureText, settlementReceiptId: sid };
   const disagree = (detail: string): Verification => ({ state: "mismatch", ...base, detail });
 
   if (onchain !== r.status) return disagree(r.status === "pending" ? `record is pending (evidence incomplete); chain now shows ${onchain}` : `record says ${r.status}, chain says ${onchain}`);
   if (onchain === "rejected") {
     // Generic class: verified when the chain shows the GUARD receipt failed, whatever the code.
     if (r.reason === GENERIC_GUARD_FAILURE) { if (!guardFailed) return disagree(`record says the guard failed, but the failure was in ${tx.transaction.receiver_id === guardId ? "the transaction itself" : "another account"}`); }
-    else if (r.reason !== chainCode) return disagree(`rejection code: record ${r.reason}, chain ${chainCode}`);
+    else if (r.reason !== chainCode) return disagree(`rejection code: record ${r.reason}, chain ${chainCode ?? "no code in the guard receipt"}`);
   }
   if (onchain === "settled" && r.settlement_receipt_id !== sid) return disagree(`settlement receipt: record ${r.settlement_receipt_id}, chain ${sid}`);
   if (onchain === "settlement_failed" && r.settlement_receipt_id && r.settlement_receipt_id !== sid) return disagree(`settlement receipt: record ${r.settlement_receipt_id}, chain ${sid}`);
@@ -216,10 +244,13 @@ export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string
 }
 
 export async function verifyRecord(r: EvidenceRecord, guardId: string): Promise<Verification> {
-  if (!r.tx_hash) return { state: "unverifiable", why: "no transaction hash in the evidence, so it can't be checked on chain" };
+  if (!r.tx_hash) return { state: "unavailable", why: NO_HASH, chain: null };
   let tx;
   try { tx = await txStatus(r.tx_hash, r.agent_id, "FINAL"); }
-  catch (e) { return { state: "unverifiable", why: `RPC couldn't load the tx (${String((e as Error)?.message ?? e)}); older txs need an archival RPC` }; }
+  catch (e) {
+    const why = `RPC couldn't load the tx (${String((e as Error)?.message ?? e)}); older txs need an archival RPC`;
+    return r.verified_at === null ? { state: "unavailable", why: `${NO_VERIFIED_AT}; ${why}`, chain: null } : { state: "unverifiable", why };
+  }
   return verifyAgainstTx(r, tx, guardId);
 }
 

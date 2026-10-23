@@ -51,16 +51,20 @@ export function useVerified(file: EvidenceFile | null | undefined, records: Evid
 export function VerifyBadge({ v, status }: { v?: Verification; status?: EvidenceRecord["status"] }) {
   if (!v) return <Badge variant="outline">checking chain...</Badge>;
   if (v.state === "verified") return <Badge variant={v.onchain === "settled" ? "ok" : "outline"} className="gap-1"><BadgeCheck className="size-3" /> verified on chain</Badge>;
-  if (v.state === "mismatch" && status === "pending") return <Badge variant="warn" className="gap-1" title={v.detail}><CircleHelp className="size-3" /> record pending, chain: {v.onchain}</Badge>;
+  // Null tx_hash / verified_at: never green, never "verified", even when the chain matches.
+  if (v.state === "unavailable") return <Badge variant={status === "pending" ? "outline" : "warn"} className="gap-1" title={v.why}><CircleHelp className="size-3" /> verification unavailable</Badge>;
   if (v.state === "mismatch") return <Badge variant="danger" className="gap-1" title={v.detail}><ShieldAlert className="size-3" /> chain disagrees: {v.onchain}</Badge>;
   return <Badge variant="outline" className="gap-1" title={v.why}><CircleHelp className="size-3" /> not verified</Badge>;
 }
 
 export function VerifyDetail({ v }: { v?: Verification }) {
   if (!v) return null;
-  const text = v.state === "unverifiable" ? v.why : v.state === "mismatch" ? v.detail
-    : v.onchain === "rejected" && v.chainCode ? `chain code: ${v.chainCode}`
-    : v.settlementReceiptId ? `ft_transfer receipt ${v.settlementReceiptId.slice(0, 8)}...` : null;
+  const failure = (c: { onchain: string; chainCode: string | null; chainFailureText: string | null }) =>
+    c.chainCode ? `chain code: ${c.chainCode}` : c.chainFailureText ? `raw failure text (${c.onchain === "settlement_failed" ? "token" : "guard"} receipt): ${c.chainFailureText}` : null;
+  const text = v.state === "unverifiable" ? v.why
+    : v.state === "unavailable" ? (v.chain ? `${v.why}. chain shows ${v.chain.onchain}${v.chain.agrees ? "" : ` (${v.chain.detail})`}${failure(v.chain) ? `; ${failure(v.chain)}` : ""}` : v.why)
+    : v.state === "mismatch" ? v.detail
+    : failure(v) ?? (v.settlementReceiptId ? `ft_transfer receipt ${v.settlementReceiptId.slice(0, 8)}...` : null);
   return text ? <div className="mt-1 max-w-[220px] text-xs text-muted-foreground">{text}</div> : null;
 }
 
