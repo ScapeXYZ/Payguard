@@ -41,7 +41,7 @@ export function validate(input) {
   return { network, rpc: url.href, guard, agent, requestId, token, recipient, amount, credentials, journal };
 }
 export function parseArgs(args) {
-  const names = { '--network': 'network', '--rpc': 'rpc', '--guard': 'guard', '--agent': 'agent', '--request-id': 'requestId', '--token': 'token', '--recipient': 'recipient', '--amount': 'amount', '--credentials': 'credentials', '--journal': 'journal' };
+  const names = { '--network': 'network', '--rpc': 'rpc', '--guard': 'guard', '--agent': 'agent', '--request-id': 'requestId', '--token': 'token', '--recipient': 'recipient', '--amount': 'amount', '--credentials': 'credentials', '--journal': 'journal', '--authorize-rebroadcast': 'authorizeRebroadcast' };
   const out = { mode: 'dry-run' };
   let modeSeen = false;
   for (let i = 0; i < args.length; i++) {
@@ -54,7 +54,7 @@ export function parseArgs(args) {
     if (!key || out[key] !== undefined || !args[i + 1] || args[i + 1].startsWith('--')) fail('Unknown, duplicate or incomplete CLI argument');
     out[key] = args[++i];
   }
-  return { ...validate(out), mode: out.mode };
+  return { ...validate(out), mode: out.mode, authorizeRebroadcast: out.authorizeRebroadcast };
 }
 async function external(path) {
   const canonical = await realpath(path);
@@ -92,6 +92,7 @@ export function makeRpc(url) {
     let json;
     try { json = await response.json(); } catch { fail('RPC response is not valid JSON'); }
     if (!json || typeof json !== 'object' || Array.isArray(json)) fail('Malformed RPC response');
+    if (Object.hasOwn(json, 'error') && Object.hasOwn(json, 'result')) fail('Inconsistent RPC response');
     if (json.error) {
       const error = new Error(JSON.stringify(json.error));
       error.rpcError = json.error;
@@ -175,13 +176,35 @@ export function classify(outcome, entry) {
   return Object.hasOwn(outcome.status, 'SuccessValue') ? 'succeeded' : 'uncertain';
 }
 function unknownTransaction(error) {
-  // Only an explicit structured RPC classification permits rebroadcast. Never infer from message text.
+  // Structured unknown is a lookup result, never proof of non-execution. Do not infer from text.
   return error.rpcError?.cause?.name === 'UNKNOWN_TRANSACTION' || error.rpcError?.data?.name === 'UNKNOWN_TRANSACTION';
+}
+// Expiry is independent of execution: an expired transaction may already have executed.
+async function referenceValidity(entry, rpc) {
+  const tx = transactions.SignedTransaction.decode(Buffer.from(entry.signed_transaction, 'base64')).transaction;
+  const hash = utils.serialize.base_encode(Uint8Array.from(tx.blockHash));
+  const finalized = await rpc('block', { finality: 'final' });
+  const reference = await rpc('block', { block_id: hash });
+  const height = finalized?.header?.height;
+  const base = reference?.header?.height;
+  const config = await rpc('EXPERIMENTAL_protocol_config', { block_id: finalized?.header?.hash });
+  const period = config?.transaction_validity_period;
+  if (!Number.isSafeInteger(height) || !Number.isSafeInteger(base) || base < 0 || height < base ||
+      !Number.isSafeInteger(period) || period <= 0 || reference?.header?.hash !== hash ||
+      typeof finalized?.header?.hash !== 'string') fail('Invalid reference-block validity evidence');
+  // Confirm the reference belongs to the finalized canonical chain, not merely a known fork.
+  const canonical = await rpc('block', { block_id: base });
+  if (canonical?.header?.hash !== hash) fail('Reference block is not finalized canonical');
+  return { status: height - base > period ? 'expired' : 'within_validity_window',
+    reference_block_hash: hash, reference_height: base, finalized_height: height,
+    finalized_block_hash: finalized.header.hash, transaction_validity_period: period };
 }
 export async function runPayment(input, { rpc, key } = {}) {
   const c = validate(input);
   const mode = input.mode ?? 'dry-run';
   if (!['dry-run', 'execute', 'reconcile'].includes(mode)) fail('Invalid mode');
+  if (input.authorizeRebroadcast !== undefined && (mode !== 'execute' ||
+      !exact(input.authorizeRebroadcast, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/))) fail('Rebroadcast authorization requires execute and exact transaction hash');
   key ??= await stage('Credential loading', () => loadAgentKey(c.credentials, c.agent));
   rpc ??= makeRpc(c.rpc);
   const intent = intentOf(c);
@@ -191,6 +214,7 @@ export async function runPayment(input, { rpc, key } = {}) {
     let entry = await store.read(c.requestId);
     if (entry && (entry.version !== 1 || JSON.stringify(entry.intent) !== JSON.stringify(intent) || entry.public_key !== check.publicKey)) fail('Request ID already bound to different intent/key or unsupported journal');
     if (!entry) {
+      if (input.authorizeRebroadcast) fail('Rebroadcast authorization requires existing signed entry');
       if (mode === 'reconcile') fail('No journal entry for request ID');
       entry = { version: 1, intent, public_key: check.publicKey, created_at: stamp(), state: 'prepared', events: [] };
       await store.save(entry); // Business intent durable BEFORE signing or broadcast.
@@ -198,6 +222,8 @@ export async function runPayment(input, { rpc, key } = {}) {
     if (!Array.isArray(entry.events) || !['prepared', 'signed', 'uncertain', 'succeeded', 'failed'].includes(entry.state) ||
         (entry.state === 'prepared' ? entry.signed_transaction || entry.transaction_hash : !entry.signed_transaction || !entry.transaction_hash)) fail('Inconsistent journal state; refusing fresh signature');
     if (['succeeded', 'failed'].includes(entry.state)) { verifySignedEntry(entry, key); return summary(entry); }
+    const freshSignature = !entry.signed_transaction;
+    if (input.authorizeRebroadcast && input.authorizeRebroadcast !== entry.transaction_hash) fail('Rebroadcast authorization hash mismatch');
     if (!entry.signed_transaction && mode === 'execute') {
       const signer = await InMemorySigner.fromKeyPair(c.network, c.agent, key);
       const [hash, signed] = await transactions.signTransaction(c.guard, check.nonce,
@@ -215,24 +241,45 @@ export async function runPayment(input, { rpc, key } = {}) {
       await store.save(entry);
     };
     let mayBroadcast = false;
+    let observed = false;
     try {
+      const observation = await rpc('tx_status', { tx_hash: entry.transaction_hash, sender_account_id: c.agent, wait_until: 'NONE' });
+      observed = true;
+      // Check identity even when NONE returns no terminal execution evidence.
+      // Settlement always requires a separate FINAL lookup.
+      classify(observation, entry);
+      await record('transaction_observed', observation);
       const outcome = await rpc('tx_status', { tx_hash: entry.transaction_hash, sender_account_id: c.agent, wait_until: 'FINAL' });
       entry.state = classify(outcome, entry);
+      entry.recovery = { lookup: entry.state === 'uncertain' ? 'nonfinal' : 'confirmed', validity: { status: 'not_checked' } };
       await record('reconciliation', outcome);
       return summary(entry);
     } catch (error) {
       entry.state = 'uncertain';
-      mayBroadcast = unknownTransaction(error);
+      // Unknown after an observation is contradictory evidence, not retry permission.
+      mayBroadcast = !observed && unknownTransaction(error);
+      entry.recovery = { lookup: mayBroadcast ? 'unknown_transaction' : 'rpc_error', validity: { status: 'unresolved' } };
       await record('reconciliation_error', { message: String(error.message), rpc: error.rpcError ?? null });
     }
-    if (mode === 'reconcile' || !mayBroadcast) return summary(entry);
-    await record('broadcast_attempt', { transaction_hash: entry.transaction_hash });
+    try {
+      entry.recovery.validity = await referenceValidity(entry, rpc);
+      await record('reference_validity', entry.recovery);
+    } catch (error) {
+      entry.recovery.validity = { status: 'unresolved' };
+      await record('reference_validity_error', { message: String(error.message), rpc: error.rpcError ?? null });
+    }
+    if (mode === 'reconcile' || !mayBroadcast || entry.recovery.validity.status !== 'within_validity_window' ||
+        (!freshSignature && input.authorizeRebroadcast !== entry.transaction_hash)) return summary(entry);
+    await record('broadcast_attempt', { transaction_hash: entry.transaction_hash,
+      authorization: freshSignature ? 'initial_execute' : 'explicit_hash', authorized_hash: input.authorizeRebroadcast ?? null });
     try {
       const outcome = await rpc('send_tx', { signed_tx_base64: entry.signed_transaction, wait_until: 'FINAL' });
       entry.state = classify(outcome, entry);
+      entry.recovery.lookup = entry.state === 'uncertain' ? 'nonfinal' : 'confirmed';
       await record('broadcast_outcome', outcome);
     } catch (error) {
       entry.state = 'uncertain';
+      entry.recovery.lookup = 'rpc_error';
       await record('broadcast_error', { message: String(error.message), rpc: error.rpcError ?? null });
     }
     return summary(entry);
@@ -251,7 +298,7 @@ function verifySignedEntry(entry, key) {
       !key.verify(hash, Uint8Array.from(signed.signature.ed25519Signature?.data ?? []))) fail('Journal signed transaction integrity mismatch');
 }
 function summary(entry) {
-  return { request_id: entry.intent.payment.request_id, state: entry.state, transaction_hash: entry.transaction_hash ?? null,
+  return { request_id: entry.intent.payment.request_id, state: entry.state, transaction_hash: entry.transaction_hash ?? null, recovery: entry.recovery,
     note: entry.state === 'failed' ? 'Final transaction/receipt failure; reservation may remain. Do not create a new business ID to bypass replay protection.' :
       entry.state === 'uncertain' ? 'Unresolved. Reconcile this ID; no fresh transaction will be signed.' : undefined };
 }

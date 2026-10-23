@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Offline projection only: no SDK, credentials, signing, or network access.
+// Offline by default; optional read-only RPC verification never writes the journal.
+import { evidenceRpc, enrichEvidence } from './verify-payment-evidence.mjs';
 import { constants } from 'node:fs';
 import { open, lstat, realpath, readdir, rename, unlink } from 'node:fs/promises';
 import { resolve, dirname, basename, join, sep, isAbsolute } from 'node:path';
@@ -11,6 +12,23 @@ const matches = (v, re) => typeof v === 'string' && re.exec(v)?.[0] === v;
 const id = v => matches(v, /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/) && v.length >= 2 && v.length <= 64;
 const hash = v => matches(v, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/) ? v : null;
 const success = s => s && (Object.hasOwn(s, 'SuccessValue') || Object.hasOwn(s, 'SuccessReceiptId'));
+
+// A successful FT call may produce protocol gas refunds. Verify their bodies
+// and terminal outcomes explicitly; arbitrary contract continuations stay reserved.
+function onlyRefundChildren(ft, data, agent) {
+  return Array.isArray(ft?.outcome?.receipt_ids) && ft.outcome.receipt_ids.every(child => {
+    const bodies = (data.receipts ?? []).filter(r => r?.receipt_id === child);
+    const outcome = data.receipts_outcome.find(o => o.id === child)?.outcome;
+    if (bodies.length !== 1) return false;
+    const r = bodies[0], action = r.receipt?.Action;
+    const transfer = action?.actions?.[0]?.Transfer;
+    return r.predecessor_id === 'system' && r.receiver_id === agent &&
+      action.gas_price === '0' && action.actions.length === 1 &&
+      matches(transfer?.deposit, /^[1-9][0-9]*$/) &&
+      outcome?.executor_id === agent && Object.hasOwn(outcome.status ?? {}, 'SuccessValue') &&
+      Array.isArray(outcome.receipt_ids) && outcome.receipt_ids.length === 0;
+  });
+}
 
 export function project(entry) {
   const i = entry?.intent, p = i?.payment;
@@ -24,7 +42,7 @@ export function project(entry) {
     recipient_id: p.recipient_id, token_id: p.token_id, amount: p.amount, tx_hash: hash(entry.transaction_hash),
     status: 'pending', source: 'runner_journal', note: 'Outcome unresolved; runner state alone does not verify settlement.' });
   // Use only the latest persisted lookup/submission outcome. Never export arbitrary logs/errors.
-  const event = entry.events.filter(e => ['reconciliation', 'broadcast_outcome'].includes(e?.type)).at(-1);
+  const event = entry.events.filter(e => ['reconciliation', 'broadcast_outcome', 'receipt_verification'].includes(e?.type)).at(-1);
   const d = event?.data;
   if (r.tx_hash && d?.transaction?.hash === r.tx_hash && d.transaction.signer_id === i.agent &&
       d.transaction.receiver_id === i.guard && d.final_execution_status === 'FINAL' && Array.isArray(d.receipts_outcome) &&
@@ -52,7 +70,7 @@ export function project(entry) {
         const ft = outcomes.find(o => o.id === transfer.receipt_id && o.outcome?.executor_id === p.token_id);
         if (Object.hasOwn(ft?.outcome?.status ?? {}, 'Failure')) {
           r.status = 'settlement_failed'; r.reason = 'ft_transfer_failed';
-        } else if (Object.hasOwn(ft?.outcome?.status ?? {}, 'SuccessValue') && ft.outcome.receipt_ids?.length === 0) {
+        } else if (Object.hasOwn(ft?.outcome?.status ?? {}, 'SuccessValue') && onlyRefundChildren(ft, d, i.agent)) {
           r.status = 'settled'; r.settlement_receipt_id = hash(ft.id);
           // A receipt ID must be well formed before it can certify settlement.
           if (!r.settlement_receipt_id) r.status = 'pending';
@@ -60,7 +78,7 @@ export function project(entry) {
       }
     }
     if (r.status !== 'pending') {
-      r.note = 'Classified from persisted FINAL RPC receipt evidence; RPC and token semantics are trusted. Balances are not reconciled.';
+      r.note = 'Classified from FINAL RPC receipt evidence; RPC and token semantics are trusted. Balances are not reconciled.';
       if (matches(event.at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/) && Number.isFinite(Date.parse(event.at)) && new Date(event.at).toISOString() === event.at) r.verified_at = event.at;
     }
   }
@@ -68,7 +86,8 @@ export function project(entry) {
   return r;
 }
 
-export async function exportEvidence({ journal, output, network, guard }) {
+export async function exportEvidence({ journal, output, network, guard, rpc: endpoint }, { rpc } = {}) {
+  if (endpoint) rpc ??= evidenceRpc(endpoint);
   if (!['testnet', 'mainnet'].includes(network) || !id(guard)) fail();
   if (!isAbsolute(journal ?? '') || !isAbsolute(output ?? '') || basename(output) === '.' || !output.endsWith('.json')) fail();
   if ((await lstat(journal)).isSymbolicLink() || !(await lstat(journal)).isDirectory()) fail();
@@ -85,14 +104,20 @@ export async function exportEvidence({ journal, output, network, guard }) {
     let entry;
     try { const s = await handle.stat(); if (!s.isFile() || s.nlink !== 1 || s.size > 16 * 1024 * 1024) fail(); entry = JSON.parse(await handle.readFile('utf8')); }
     finally { await handle.close(); }
-    const record = project(entry);
+    let record = project(entry);
+    if (record.network !== network || record.guard_id !== guard) fail();
+    if (rpc) {
+      entry = await enrichEvidence(entry, rpc);
+      record = project(entry);
+      record.source = 'runner_journal_rpc';
+    }
     if (record.network !== network || record.guard_id !== guard || seen.has(record.request_id)) fail();
     delete record.network; delete record.guard_id;
     seen.add(record.request_id); records.push(record);
   }
   records.sort((a, b) => a.request_id < b.request_id ? -1 : a.request_id > b.request_id ? 1 : 0);
   const payload = JSON.stringify({ schema: 'payguard.evidence.v2', network, guard_id: guard,
-    generated_at: new Date().toISOString(), source: 'runner_journal', records }, null, 2) + '\n';
+    generated_at: new Date().toISOString(), source: rpc ? 'runner_journal_rpc' : 'runner_journal', records }, null, 2) + '\n';
   const temp = join(parent, `.evidence-${randomUUID()}`);
   try {
     const handle = await open(temp, 'wx', 0o600);
@@ -107,7 +132,7 @@ export async function exportEvidence({ journal, output, network, guard }) {
 export function parseArgs(args) {
   const result = {};
   for (let n = 0; n < args.length; n += 2) {
-    const key = { '--journal': 'journal', '--output': 'output', '--network': 'network', '--guard': 'guard' }[args[n]];
+    const key = { '--journal': 'journal', '--output': 'output', '--network': 'network', '--guard': 'guard', '--rpc': 'rpc' }[args[n]];
     if (!key || result[key] || !args[n + 1]) fail();
     result[key] = args[n + 1];
   }

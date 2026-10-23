@@ -166,3 +166,98 @@ test('untrusted enrichment and missing observation timestamps never fabricate ve
   e.events[0].data.receipts_outcome[1].outcome.receipt_ids = [guardReceipt];
   assert.equal(project(e).status, 'reserved');
 });
+
+
+// All RPCs are mocked; no test sends a transaction or reads a live journal.
+import { enrichEvidence, evidenceRpc } from '../scripts/verify-payment-evidence.mjs';
+function mockRpc(data, body, calls = []) {
+  return async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'status') return { chain_id: 'testnet' };
+    if (method === 'tx_status') return structuredClone(data);
+    if (method === 'EXPERIMENTAL_receipt') return structuredClone(body);
+    throw new Error('Unexpected RPC method');
+  };
+}
+test('read-only enrichment fetches actual missing bodies, verifies FINAL transfer and preserves journal', async t => {
+  const f = await disk(t), e = fixture(), calls = [];
+  const data = structuredClone(e.events[0].data), body = data.receipts[0];
+  delete data.receipts; delete e.events[0].data.receipts;
+  assert.equal(project(e).status, 'pending');
+  const original = JSON.stringify(e);
+  await writeFile(join(f.journal, 'invoice-1.json'), original);
+  await exportEvidence(f, { rpc: mockRpc(data, body, calls) });
+  const output = JSON.parse(await readFile(f.output, 'utf8'));
+  assert.equal(output.source, 'runner_journal_rpc');
+  assert.equal(output.records[0].source, 'runner_journal_rpc');
+  assert.equal(output.records[0].status, 'settled');
+  assert.equal(output.records[0].settlement_receipt_id, ftReceipt);
+  assert.equal(new Date(output.records[0].verified_at).toISOString(), output.records[0].verified_at);
+  assert.equal(await readFile(join(f.journal, 'invoice-1.json'), 'utf8'), original);
+  assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status', 'EXPERIMENTAL_receipt']);
+  assert.deepEqual(calls[1].params, { tx_hash: tx, sender_account_id: 'agent.testnet', wait_until: 'FINAL' });
+  assert.deepEqual(calls[2].params, { receipt_id: ftReceipt });
+});
+test('receipt bodies already present need no individual receipt query', async () => {
+  const e = fixture(), calls = [];
+  const enriched = await enrichEvidence(e, mockRpc(e.events[0].data, null, calls));
+  assert.equal(project(enriched).status, 'settled');
+  assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status']);
+});
+test('verified failed FT receipts and mismatched actions remain conservative', async () => {
+  for (const [mutate, expected] of [
+    [d => { d.receipts_outcome[1].outcome.status = { Failure: {} }; }, 'settlement_failed'],
+    [d => { d.receipts[0].receiver_id = 'wrong.testnet'; }, 'pending'],
+    [d => { d.receipts[0].predecessor_id = 'wrong.testnet'; }, 'pending'],
+    ...[{ receiver_id: 'wrong.testnet', amount: '40000000' }, { receiver_id: 'merchant.testnet', amount: '1' }].map(args =>
+      [d => { d.receipts[0].receipt.Action.actions[0].FunctionCall.args = Buffer.from(JSON.stringify(args)).toString('base64'); }, 'pending']),
+  ]) {
+    const e = fixture(), data = structuredClone(e.events[0].data); mutate(data);
+    assert.equal(project(await enrichEvidence(e, mockRpc(data))).status, expected);
+  }
+});
+test('incomplete, nonfinal and contradictory RPC evidence fails without publishing output', async t => {
+  const f = await disk(t), e = fixture();
+  await writeFile(join(f.journal, 'invoice-1.json'), JSON.stringify(e));
+  await writeFile(f.output, 'previous');
+  for (const mutate of [
+    d => { d.final_execution_status = 'EXECUTED'; },
+    d => { d.transaction.hash = 'wrong'; },
+    d => { d.transaction.signer_id = 'wrong.testnet'; },
+    d => { d.receipts_outcome.pop(); },
+    d => { d.receipts_outcome[1].outcome.status = { Unknown: true }; },
+    d => { d.receipts_outcome.push(d.receipts_outcome[0]); },
+    d => { delete d.transaction_outcome; },
+    d => { delete d.receipts; },
+  ]) {
+    const data = structuredClone(e.events[0].data); mutate(data);
+    await assert.rejects(exportEvidence(f, { rpc: mockRpc(data, { receipt_id: guardReceipt }) }));
+    assert.equal(await readFile(f.output, 'utf8'), 'previous');
+  }
+  await assert.rejects(enrichEvidence(e, async () => ({ chain_id: 'mainnet' })));
+  await assert.rejects(enrichEvidence(e, async () => { throw new Error('RPC unavailable'); }));
+  for (const url of ['http://rpc.testnet.near.org', 'https://secret:password@example.com', 'https://example.com/#fragment']) assert.throws(() => evidenceRpc(url));
+});
+
+test('only proven terminal system refunds can accompany a settled FT call', async () => {
+  const e = fixture(), data = e.events[0].data, refund = '4'.repeat(44);
+  data.receipts_outcome[1].outcome.receipt_ids = [refund];
+  data.receipts_outcome.push({ id: refund, outcome: { executor_id: 'agent.testnet', status: { SuccessValue: '' }, receipt_ids: [] } });
+  const body = { receipt_id: refund, predecessor_id: 'system', receiver_id: 'agent.testnet', receipt: { Action: {
+    gas_price: '0', actions: [{ Transfer: { deposit: '123' } }],
+  } } };
+  assert.equal(project(e).status, 'reserved');
+  data.receipts.push(body);
+  assert.equal(project(e).status, 'settled');
+  for (const mutate of [
+    d => { d.receipts[1].predecessor_id = 'token.testnet'; },
+    d => { d.receipts[1].receipt.Action.actions = [{ FunctionCall: { method_name: 'callback' } }]; },
+    d => { d.receipts_outcome[2].outcome.status = { Failure: {} }; },
+    d => { d.receipts_outcome[2].outcome.receipt_ids = [ftReceipt]; },
+  ]) {
+    const copy = structuredClone(e); mutate(copy.events[0].data);
+    assert.equal(project(copy).status, 'reserved');
+  }
+  data.receipts.pop();
+  assert.equal(project(await enrichEvidence(e, mockRpc(data, body))).status, 'settled');
+});

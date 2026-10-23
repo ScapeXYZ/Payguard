@@ -26,7 +26,11 @@ async function fixture(t) {
   const rpc = async (method, params) => {
     calls.push({ method, params });
     if (method === 'status') return { chain_id: state.chain ?? 'testnet', sync_info: { syncing: false } };
-    if (method === 'block') return { header: { hash: blockHash } };
+    if (method === 'block') {
+      if (state.blockError) throw new Error('block unavailable');
+      return { header: { hash: blockHash, height: params.finality ? (state.height ?? 100) : 100 } };
+    }
+    if (method === 'EXPERIMENTAL_protocol_config') return { transaction_validity_period: state.period ?? 86400 };
     if (method === 'query') {
       assert.equal(params.block_id, blockHash);
       if (params.request_type === 'call_function') return { result: [...Buffer.from(JSON.stringify({ agent_id: state.agent ?? c.agent }))] };
@@ -91,7 +95,7 @@ test('explicit unknown on retry rebroadcasts identical signed bytes and nonce', 
   await runPayment(f.c, { rpc: f.rpc });
   const first = await f.journal(); f.state.nonce = 9;
   f.state.send = null;
-  const result = await runPayment(f.c, { rpc: f.rpc });
+  const result = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc: f.rpc });
   assert.equal(result.state, 'succeeded'); assert.equal(result.transaction_hash, first.transaction_hash);
   assert.equal((await f.journal()).signed_transaction, first.signed_transaction);
   assert.equal(f.calls.filter(x => x.method === 'send_tx').length, 2);
@@ -350,4 +354,136 @@ test('actual CLI and npm dry-run serialize nonce and keep diagnostics secret-fre
     return true;
   });
   await assert.rejects(access(f.c.journal), { code: 'ENOENT' });
+});
+
+test('HTTP 408 before broadcast remains unresolved across restart; unknown needs authorization', async t => {
+  const f = await fixture(t);
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: false, status: 408 }));
+  f.state.lookup = () => makeRpc(f.c.rpc)('tx_status');
+  const first = await runPayment(f.c, { rpc: f.rpc });
+  const original = await f.journal();
+  assert.equal(first.recovery.lookup, 'rpc_error');
+  assert.equal(first.state, 'uncertain');
+  assert.equal(f.calls.filter(c => c.method === 'send_tx').length, 0);
+  f.state.lookup = null;
+  const next = await runPayment(f.c, { rpc: f.rpc });
+  assert.equal(next.recovery.lookup, 'unknown_transaction');
+  assert.equal(next.transaction_hash, first.transaction_hash);
+  assert.equal((await f.journal()).signed_transaction, original.signed_transaction);
+  assert.deepEqual((await f.journal()).events.slice(0, original.events.length), original.events);
+  assert.equal(f.calls.filter(c => c.method === 'send_tx').length, 0);
+  await assert.rejects(runPayment({ ...f.c, authorizeRebroadcast: blockHash }, { rpc: f.rpc }), /hash mismatch/);
+  const result = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc: f.rpc });
+  assert.equal(result.state, 'succeeded');
+  assert.equal(f.calls.filter(c => c.method === 'send_tx').length, 1);
+});
+
+test('protocol expiry boundary blocks even authorized retry and retains signed evidence', async t => {
+  const f = await fixture(t);
+  f.state.lookup = async () => { throw new Error('timeout'); };
+  const first = await runPayment(f.c, { rpc: f.rpc });
+  const original = await f.journal();
+  f.state.lookup = null;
+  f.state.period = 3542;
+  f.state.height = 3642;
+  const boundary = await runPayment({ ...f.c, mode: 'reconcile' }, { rpc: f.rpc });
+  assert.equal(boundary.recovery.validity.status, 'within_validity_window');
+  f.state.height++;
+  const expired = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc: f.rpc });
+  assert.equal(expired.recovery.validity.status, 'expired');
+  assert.equal(expired.state, 'uncertain');
+  assert.equal(expired.transaction_hash, first.transaction_hash);
+  assert.equal((await f.journal()).signed_transaction, original.signed_transaction);
+  assert.equal(f.calls.some(c => c.method === 'send_tx'), false);
+  f.state.lookup = async p => f.outcome(p.tx_hash);
+  assert.equal((await runPayment({ ...f.c, mode: 'reconcile' }, { rpc: f.rpc })).state, 'succeeded');
+});
+
+test('unavailable validity evidence prevents authorized broadcast', async t => {
+  const f = await fixture(t);
+  f.state.lookup = async () => { throw new Error('timeout'); };
+  const first = await runPayment(f.c, { rpc: f.rpc });
+  f.state.lookup = null;
+  const rpc = (method, params) => method === 'EXPERIMENTAL_protocol_config' ? Promise.reject(new Error('timeout')) : f.rpc(method, params);
+  const result = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc });
+  assert.equal(result.recovery.validity.status, 'unresolved');
+  assert.equal(f.calls.some(c => c.method === 'send_tx'), false);
+});
+
+test('3542 blocks is not an arbitrary expiry threshold; canonical forks and malformed config fail closed', async t => {
+  const f = await fixture(t);
+  f.state.lookup = async () => { throw new Error('timeout'); };
+  const first = await runPayment(f.c, { rpc: f.rpc });
+  f.state.lookup = null;
+  f.state.height = 3642;
+  const result = await runPayment({ ...f.c, mode: 'reconcile' }, { rpc: f.rpc });
+  assert.equal(result.recovery.validity.status, 'within_validity_window');
+  assert.equal(result.recovery.validity.transaction_validity_period, 86400);
+  for (const period of [undefined, null, -1, 0, '86400', Number.MAX_SAFE_INTEGER + 1]) {
+    const rpc = (method, params) => method === 'EXPERIMENTAL_protocol_config'
+      ? Promise.resolve({ transaction_validity_period: period }) : f.rpc(method, params);
+    const invalid = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc });
+    assert.equal(invalid.recovery.validity.status, 'unresolved');
+  }
+  const rpc = (method, params) => method === 'block' && typeof params.block_id === 'number'
+    ? Promise.resolve({ header: { hash: 'fork', height: 100 } }) : f.rpc(method, params);
+  const fork = await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc });
+  assert.equal(fork.recovery.validity.status, 'unresolved');
+  assert.equal(f.calls.some(c => c.method === 'send_tx'), false);
+});
+
+test('rebroadcast authorization is invocation scoped and forbidden in read-only modes', async t => {
+  const f = await fixture(t);
+  f.state.send = async () => { throw new Error('timeout'); };
+  const first = await runPayment(f.c, { rpc: f.rpc });
+  await runPayment({ ...f.c, authorizeRebroadcast: first.transaction_hash }, { rpc: f.rpc });
+  assert.equal((await f.journal()).events.filter(e => e.type === 'broadcast_attempt').at(-1).data.authorization, 'explicit_hash');
+  await runPayment(f.c, { rpc: f.rpc });
+  assert.equal(f.calls.filter(c => c.method === 'send_tx').length, 2);
+  for (const mode of ['dry-run', 'reconcile']) {
+    await assert.rejects(runPayment({ ...f.c, mode, authorizeRebroadcast: first.transaction_hash }, { rpc: f.rpc }), /authorization/);
+  }
+});
+
+for (const scenario of ['unknown', 'nonfinal', 'success', 'failure', 'timeout-none', 'timeout-final', 'unknown-final', 'malformed-none', 'malformed-final', 'identity-none', 'identity-final']) {
+  test(`two-stage reconciliation: ${scenario}`, async t => {
+    const f = await fixture(t);
+    // Persist an uncertain signed entry with zero broadcast attempts.
+    f.state.lookup = async () => { throw new Error('HTTP 408'); };
+    const first = await runPayment(f.c, { rpc: f.rpc });
+    const original = await f.journal();
+    const start = f.calls.length;
+    f.state.lookup = async p => {
+      const final = p.wait_until === 'FINAL';
+      if (scenario === 'unknown' || (scenario === 'unknown-final' && final)) throw unknown();
+      if (scenario === `timeout-${final ? 'final' : 'none'}`) throw new Error('HTTP 408');
+      if (scenario === `malformed-${final ? 'final' : 'none'}`) return {};
+      if (scenario === `identity-${final ? 'final' : 'none'}`) return f.outcome('wrong-hash');
+      if (!final) return f.outcome(p.tx_hash); // Even final-looking NONE evidence needs FINAL.
+      if (scenario === 'nonfinal') return f.outcome(p.tx_hash, { final_execution_status: 'EXECUTED_OPTIMISTIC' });
+      if (scenario === 'failure') return f.outcome(p.tx_hash, {
+        receipts_outcome: [{ outcome: { status: { Failure: { ActionError: 'failed transfer' } } } }],
+      });
+      return f.outcome(p.tx_hash);
+    };
+    // Authorization must not overcome transport, malformed, nonfinal or contradictory evidence.
+    const result = await runPayment({ ...f.c, ...(scenario === 'unknown' ? { mode: 'reconcile' } : { authorizeRebroadcast: first.transaction_hash }) }, { rpc: f.rpc });
+    const lookups = f.calls.slice(start).filter(c => c.method === 'tx_status');
+    const onlyNone = ['unknown', 'timeout-none', 'malformed-none', 'identity-none'].includes(scenario);
+    assert.deepEqual(lookups.map(c => c.params.wait_until), onlyNone ? ['NONE'] : ['NONE', 'FINAL']);
+    assert.ok(lookups.every(c => c.params.tx_hash === first.transaction_hash && c.params.sender_account_id === f.c.agent));
+    assert.equal(result.state, scenario === 'success' ? 'succeeded' : scenario === 'failure' ? 'failed' : 'uncertain');
+    assert.equal(result.recovery.lookup, scenario === 'unknown' ? 'unknown_transaction' : scenario === 'nonfinal' ? 'nonfinal' : ['success', 'failure'].includes(scenario) ? 'confirmed' : 'rpc_error');
+    const saved = await f.journal();
+    assert.equal(saved.signed_transaction, original.signed_transaction);
+    assert.equal(saved.intent.payment.request_id, original.intent.payment.request_id);
+    assert.deepEqual(saved.events.slice(0, original.events.length), original.events);
+    assert.equal(f.calls.some(c => c.method === 'send_tx'), false);
+    assert.equal(saved.events.some(e => e.type === 'broadcast_attempt'), false);
+  });
+}
+
+test('RPC rejects contradictory result and structured unknown error', async t => {
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ result: {}, error: { cause: { name: 'UNKNOWN_TRANSACTION' } } }) }));
+  await assert.rejects(makeRpc('https://rpc.testnet.near.org')('tx_status', { wait_until: 'NONE' }), /Inconsistent RPC response/);
 });

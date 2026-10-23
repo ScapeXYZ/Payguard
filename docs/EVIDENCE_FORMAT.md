@@ -1,6 +1,6 @@
 # Payment evidence v2 contract
 
-The offline exporter emits `payguard.evidence.v2` for the frontend partner.
+The exporter (offline by default) emits `payguard.evidence.v2` for the frontend partner.
 Pending policy/proposal IDs are never attached to payments without evidence.
 
 ## Produce evidence
@@ -33,9 +33,16 @@ rename and directory fsync; failure after rename can mean output was published
 but durability could not be confirmed. Interrupted writes can leave `.evidence-*`
 temporary files in the output directory.
 
-No RPC calls, credentials, SDK signing, broadcasts or key/policy changes occur.
-To refresh evidence, separately reconcile using authorized operational tooling;
-this exporter does not invoke the payment runner. Records from the same journal snapshots have deterministic content and request-ID
+Without `--rpc`, no RPC calls occur. With `--rpc https://trusted-endpoint`, the
+exporter checks `status.chain_id`, requests `tx_status` at `FINAL` by saved hash
+and signer, and fetches missing linked bodies via `EXPERIMENTAL_receipt`. It checks
+matching transaction identity and complete terminal outcome links before projection.
+Missing/contradictory RPC evidence aborts export and preserves previous output.
+No credentials, signing, broadcasts, journal writes or key/policy changes occur.
+This exporter never invokes the payment runner. Enrichment is held in memory;
+no journal append is needed. RPC exports use `runner_journal_rpc` as envelope and
+record source, and `verified_at` is the completed RPC observation time. Offline
+exports retain `runner_journal` and persisted event timestamps. Offline records from the same journal snapshots have deterministic content and request-ID
 ordering. `generated_at` is the UTC ISO-8601 export time, so exports may differ
 in that field. It is not evidence time and never proves on-chain verification. A concurrent
 runner can replace individual snapshots during the scan: each file is atomic,
@@ -71,8 +78,8 @@ sorted by request ID using code-unit order. Each record contains:
 | tx_hash | Persisted base58 hash or null |
 | explorer_url | Network-specific NearBlocks transaction URL derived from validated hash, or null |
 | settlement_receipt_id | Verified successful FT receipt ID or null |
-| source | `runner_journal` |
-| verified_at | Required key: UTC ISO timestamp of persisted classified receipt observation, or null when absent/invalid/unclassified; not export time or block time |
+| source | `runner_journal` or `runner_journal_rpc` |
+| verified_at | Required key: UTC ISO timestamp of persisted classified observation (offline) or completed RPC observation, or null when absent/invalid/unclassified; not export time or block time |
 | note | Fixed description of uncertainty or verification limits |
 | scenario, token_symbol, token_decimals | Currently null; scenario may only be A–E or null. Runner has no authoritative scenario/token metadata |
 | block_height, block_timestamp_ns | Currently null; no verified block header enrichment |
@@ -101,7 +108,7 @@ success badge for null, pending, reserved, or a runner's `succeeded` label.
 
 ## Status rules and verification limits
 
-Classification requires a persisted reconciliation/broadcast outcome with matching
+Offline classification requires a persisted reconciliation/broadcast outcome with matching
 transaction hash, signer and guard and `final_execution_status: FINAL`. The latest
 such outcome event is examined. The transaction outcome must link to the guard
 receipt by `receipt_ids`; the guard receipt executor must match the guard.
@@ -111,17 +118,20 @@ receipt by `receipt_ids`; the guard receipt executor must match the guard.
 | rejected | Linked guard receipt has explicit `Failure`; reason `guard_execution_failed`. This includes guard execution errors, not necessarily a specific policy rejection. |
 | reserved | Successful guard receipt links to an exact single `ft_transfer` action from guard to configured token, with matching receiver and base-unit amount. FT completion is unverified. |
 | pending | Default for prepared, signed, uncertain, missing, nonfinal, mismatched or insufficient evidence, including runner `succeeded`/`failed` without sufficient receipts. Never relabel an unknown outcome as rejected. |
-| settled | Reserved evidence plus matching token executor's FT receipt has `SuccessValue`, no child receipts, and a valid receipt ID in the persisted FINAL outcome. Guard success or budget reservation alone is insufficient. |
+| settled | Reserved evidence plus matching token executor's FT receipt has `SuccessValue`, no child receipts except verified successful system refunds, and a valid receipt ID in the persisted FINAL outcome. Guard success or budget reservation alone is insufficient. |
 | settlement_failed | Reserved evidence plus matching token executor's FT receipt has explicit `Failure`; reason `ft_transfer_failed`. Reservation may remain consumed. |
 
 Settlement is independently checked at the FT receipt level rather than inferred
-from the guard transaction's result. This is an offline check of recorded RPC
-evidence, not independent RPC-provider consensus, cryptographic proof validation,
+from the guard transaction's result. This checks recorded or freshly fetched RPC evidence, not independent RPC-provider consensus, cryptographic proof validation,
 token code auditing or balance reconciliation. It trusts the journal provenance,
-RPC finality reporting and token semantics. Tokens that spawn further receipts
-remain reserved until a future verifier supports their execution graph. Current
-runner RPC responses may omit action-bearing `receipts`; such entries stay pending
-even if the runner records success. Raw logs and failure text are never exported.
+RPC finality reporting and token semantics. Tokens that spawn contract continuations remain reserved. Protocol refunds are
+accepted only with a real linked body: `system` predecessor, zero gas price,
+single native Transfer to the agent, and a matching successful leaf outcome.
+Missing refund bodies never count as proof. Submission RPC responses may omit action-bearing `receipts`; offline exports stay
+pending even if the runner records success. Opt-in read-only RPC verification can
+supply real bodies without changing the journal. See
+[payment-runner.md](payment-runner.md#read-only-payment-evidence-export) for the command
+and the [NEAR RPC method reference](https://docs.near.org/api/rpc/transactions). Raw logs and failure text are never exported.
 
 ## Frontend partner confirmation needed
 
