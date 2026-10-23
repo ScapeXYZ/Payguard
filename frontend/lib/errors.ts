@@ -65,6 +65,10 @@ export function describeFailure(failure: unknown): string {
 }
 
 export function isUserRejection(e: unknown): boolean {
-  const s = e instanceof Error ? e.message : String(e);
-  return /reject|denied|cancel|closed the window|user closed|declined/i.test(s);
+  // Transport failures, contract rejections and a closed wallet window do not
+  // prove that nothing was broadcast. Only an explicit user refusal unlocks signing.
+  const error = e as { code?: unknown; type?: unknown; message?: unknown } | null;
+  if (error?.code === 4001 || error?.code === "USER_REJECTED" || error?.type === "UserRejected") return true;
+  const message = e instanceof Error ? e.message : typeof e === "string" ? e : error?.message;
+  return typeof message === "string" && /^user (?:rejected|denied|cancelled|canceled)(?: the)? (?:request|transaction|signature)[.!]?$/i.test(message);
 }

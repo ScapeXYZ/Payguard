@@ -72,7 +72,7 @@ export function TxButton({ call, allowed, config, label, variant = "default", si
   disabled?: boolean; disabledWhy?: string; className?: string; onDone?: (s: TxState) => void;
 }) {
   const { accountId, connect, ready } = useWallet();
-  const { state, run, busy } = useTx();
+  const { state, run, busy, retry } = useTx();
   const roles = rolesOf(accountId, config);
   const roleOk = allowed.includes("anyone") ? !!accountId : roles.some((r) => allowed.includes(r));
   const why = IS_MOCK ? "mock data: signing disabled"
@@ -91,6 +91,9 @@ export function TxButton({ call, allowed, config, label, variant = "default", si
       )}
       {why && <p className="mt-1 text-xs text-muted-foreground">{why}</p>}
       <TxStatus state={state} />
+      {state.phase === "pending" && state.message && state.hash && (
+        <Button variant="outline" size="sm" onClick={() => { void retry(); }}>Retry verification</Button>
+      )}
     </div>
   );
 }
