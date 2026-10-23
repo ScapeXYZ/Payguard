@@ -1,0 +1,263 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, symlink, link } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { project, exportEvidence, parseArgs } from '../scripts/export-payment-evidence.mjs';
+
+const tx = '1'.repeat(44), guardReceipt = '2'.repeat(44), ftReceipt = '3'.repeat(44);
+function fixture() {
+  return { version: 1, state: 'succeeded', transaction_hash: tx, intent: { network: 'testnet', guard: 'guard.testnet', agent: 'agent.testnet',
+    payment: { request_id: 'invoice-1', recipient_id: 'merchant.testnet', token_id: 'token.testnet', amount: '40000000' } }, events: [{
+    type: 'reconciliation', at: '2026-10-23T10:00:00.000Z', data: {
+      transaction: { hash: tx, signer_id: 'agent.testnet', receiver_id: 'guard.testnet' }, final_execution_status: 'FINAL',
+      transaction_outcome: { outcome: { receipt_ids: [guardReceipt] } },
+      receipts_outcome: [
+        { id: guardReceipt, outcome: { executor_id: 'guard.testnet', status: { SuccessReceiptId: ftReceipt }, receipt_ids: [ftReceipt] } },
+        { id: ftReceipt, outcome: { executor_id: 'token.testnet', status: { SuccessValue: '' }, receipt_ids: [] } },
+      ], receipts: [{ receipt_id: ftReceipt, predecessor_id: 'guard.testnet', receiver_id: 'token.testnet', receipt: { Action: { actions: [
+        { FunctionCall: { method_name: 'ft_transfer', args: Buffer.from(JSON.stringify({ receiver_id: 'merchant.testnet', amount: '40000000' })).toString('base64') } },
+      ] } } }],
+    },
+  }] };
+}
+test('explicit statuses require receipt evidence rather than runner labels', () => {
+  const e = fixture(); assert.equal(project(e).status, 'settled');
+  e.events[0].data.receipts_outcome[1].outcome.status = { Failure: { sensitive: 'withheld' } };
+  assert.equal(project(e).status, 'settlement_failed');
+  e.events[0].data.receipts_outcome.pop(); assert.equal(project(e).status, 'reserved');
+  e.events[0].data.receipts_outcome[0].outcome.status = { Failure: {} };
+  assert.equal(project(e).status, 'rejected');
+  e.events = []; assert.equal(project(e).status, 'pending');
+  for (const state of ['prepared', 'signed', 'uncertain', 'failed', 'succeeded']) { e.state = state; assert.equal(project(e).status, 'pending'); }
+});
+test('missing fields remain null and untrusted defaults and secrets never escape', () => {
+  const e = fixture(); e.events = []; delete e.transaction_hash;
+  Object.assign(e, { private_key: 'SECRET', signed_transaction: 'SIGNED', credentials: '/secret/key', token_symbol: 'USDC', token_decimals: 6, proposal_id: 2 });
+  e.events.push({ type: 'reconciliation_error', rpc: 'https://secret:credential@rpc/', data: { message: 'seed words', signed_transaction: 'SIGNED' } });
+  const r = project(e);
+  for (const k of ['scenario', 'token_symbol', 'token_decimals', 'tx_hash', 'recipient_balance_before', 'recipient_balance_after', 'block_height', 'block_timestamp_ns', 'verified_at', 'proposal_id']) assert.equal(r[k], null);
+  assert.equal(r.amount, '40000000');
+  for (const secret of ['SECRET', 'SIGNED', '/secret/key', 'credential', 'seed words', 'USDC']) assert.equal(JSON.stringify(r).includes(secret), false);
+});
+test('uncertain, unlinked, mismatched and non-final evidence cannot certify settlement', () => {
+  for (const mutate of [
+    e => { e.events[0].data.final_execution_status = 'EXECUTED'; },
+    e => { e.events[0].data.transaction.hash = 'wrong'; },
+    e => { e.events[0].data.receipts_outcome.push(e.events[0].data.receipts_outcome[1]); },
+    e => { delete e.events[0].data.receipts; },
+    e => { e.events[0].data.transaction_outcome.outcome.receipt_ids = []; },
+    e => { e.events[0].data.receipts[0].predecessor_id = 'other.testnet'; },
+    e => { e.events[0].data.receipts[0].receipt.Action.actions[0].FunctionCall.args = 'invalid'; },
+  ]) { const e = fixture(); mutate(e); assert.equal(project(e).status, 'pending'); }
+  const e = fixture(); e.events[0].data.receipts_outcome[1].outcome.status = { Unknown: true };
+  assert.equal(project(e).status, 'reserved');
+});
+async function disk(t) {
+  const root = await mkdtemp(join(tmpdir(), 'payguard-evidence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const journal = join(root, 'journal'); await mkdir(journal);
+  return { root, journal, output: join(root, 'evidence.json'), network: 'testnet', guard: 'guard.testnet' };
+}
+test('deterministic atomic exports preserve journal bytes and ignore incomplete snapshots', async t => {
+  const f = await disk(t); const original = JSON.stringify(fixture());
+  await writeFile(join(f.journal, 'invoice-1.json'), original);
+  await writeFile(join(f.journal, '.pending-crash'), 'incomplete');
+  await exportEvidence(f); const first = await readFile(f.output, 'utf8');
+  await exportEvidence(f);
+  const next = JSON.parse(await readFile(f.output, 'utf8'));
+  const prior = JSON.parse(first);
+  assert.ok(Number.isFinite(Date.parse(next.generated_at)));
+  next.generated_at = prior.generated_at;
+  assert.deepEqual(next, prior);
+  assert.equal(await readFile(join(f.journal, 'invoice-1.json'), 'utf8'), original);
+  assert.deepEqual((await readdir(f.root)).sort(), ['evidence.json', 'journal']);
+});
+test('duplicates and malformed journals fail without replacing previous output', async t => {
+  const f = await disk(t); await writeFile(f.output, 'previous');
+  await writeFile(join(f.journal, 'a.json'), JSON.stringify(fixture()));
+  await writeFile(join(f.journal, 'b.json'), JSON.stringify(fixture()));
+  await assert.rejects(exportEvidence(f)); assert.equal(await readFile(f.output, 'utf8'), 'previous');
+  await writeFile(join(f.journal, 'b.json'), '{');
+  await assert.rejects(exportEvidence(f)); assert.equal(await readFile(f.output, 'utf8'), 'previous');
+  for (const e of [null, {}, { ...fixture(), version: 99 }, { ...fixture(), events: null }]) assert.throws(() => project(e));
+});
+test('safe paths reject journal writes, symlinks, hardlinks, relative and absent output parents', async t => {
+  const f = await disk(t);
+  await assert.rejects(exportEvidence({ ...f, output: join(f.journal, 'export.json') }));
+  await assert.rejects(exportEvidence({ ...f, output: 'relative.json' }));
+  await assert.rejects(exportEvidence({ ...f, output: join(f.root, 'missing', 'export.json') }));
+  await writeFile(join(f.root, 'victim.json'), 'preserved');
+  await symlink(join(f.root, 'victim.json'), f.output);
+  await assert.rejects(exportEvidence(f)); assert.equal(await readFile(f.output, 'utf8'), 'preserved');
+  await symlink(f.journal, join(f.root, 'alias'));
+  await assert.rejects(exportEvidence({ ...f, journal: join(f.root, 'alias') }));
+  await link(join(f.root, 'victim.json'), join(f.journal, 'a.json'));
+  await assert.rejects(exportEvidence({ ...f, output: join(f.root, 'other.json') }));
+});
+test('empty journal exports a v2 deployment envelope; CLI arguments are explicit', async t => {
+  const f = await disk(t); assert.equal(await exportEvidence(f), 0);
+  const payload = JSON.parse(await readFile(f.output, 'utf8'));
+  assert.ok(Number.isFinite(Date.parse(payload.generated_at)));
+  assert.deepEqual(payload, { schema: 'payguard.evidence.v2', network: 'testnet', guard_id: 'guard.testnet',
+    generated_at: payload.generated_at, source: 'runner_journal', records: [] });
+  assert.deepEqual(parseArgs(['--journal', f.journal, '--output', f.output, '--network', 'testnet', '--guard', 'guard.testnet']),
+    { journal: f.journal, output: f.output, network: 'testnet', guard: 'guard.testnet' });
+  for (const args of [[], ['--journal', f.journal], ['--rpc', 'url'], ['--journal', f.journal, '--journal', f.journal]]) assert.throws(() => parseArgs(args));
+});
+
+test('v2 schema validation: complete envelope, required nullable fields and conservative types', async t => {
+  const f = await disk(t);
+  await writeFile(join(f.journal, 'a.json'), JSON.stringify(fixture()));
+  const pending = fixture(); pending.intent.payment.request_id = 'invoice-0'; pending.events = [];
+  await writeFile(join(f.journal, 'z.json'), JSON.stringify(pending));
+  await exportEvidence(f);
+  const value = JSON.parse(await readFile(f.output, 'utf8'));
+  assert.deepEqual(Object.keys(value).sort(), ['schema', 'network', 'guard_id', 'generated_at', 'source', 'records'].sort());
+  assert.equal(value.schema, 'payguard.evidence.v2');
+  assert.equal(value.network, 'testnet'); assert.equal(value.guard_id, 'guard.testnet');
+  assert.equal(value.source, 'runner_journal');
+  assert.equal(new Date(value.generated_at).toISOString(), value.generated_at);
+  assert.deepEqual(value.records.map(r => r.request_id), ['invoice-0', 'invoice-1']);
+  const fields = 'request_id scenario agent_id recipient_id token_id token_symbol token_decimals amount status reason tx_hash block_height block_timestamp_ns explorer_url settlement_receipt_id policy_id proposal_id source verified_at recipient_balance_before recipient_balance_after note'.split(' ');
+  for (const r of value.records) {
+    assert.deepEqual(Object.keys(r).sort(), [...fields].sort());
+    for (const key of ['request_id', 'agent_id', 'recipient_id', 'token_id', 'amount', 'source', 'note']) assert.equal(typeof r[key], 'string');
+    assert.match(r.amount, /^[1-9][0-9]*$/);
+    assert.ok(['rejected', 'pending', 'reserved', 'settlement_failed', 'settled'].includes(r.status));
+    assert.ok(r.scenario === null || ['A', 'B', 'C', 'D', 'E'].includes(r.scenario));
+    assert.equal(r.policy_id, null);
+    assert.ok(r.proposal_id === null || (typeof r.proposal_id === 'string' && /^[0-9]+$/.test(r.proposal_id)));
+    assert.ok(r.token_decimals === null || (Number.isInteger(r.token_decimals) && r.token_decimals >= 0));
+    for (const key of ['token_symbol', 'reason', 'tx_hash', 'block_timestamp_ns', 'explorer_url', 'settlement_receipt_id', 'recipient_balance_before', 'recipient_balance_after']) assert.ok(r[key] === null || typeof r[key] === 'string');
+    assert.equal(r.block_height, null);
+    assert.equal(r.source, 'runner_journal');
+    if (r.verified_at !== null) assert.equal(new Date(r.verified_at).toISOString(), r.verified_at);
+  }
+  assert.equal(value.records[0].verified_at, null);
+  assert.equal(value.records[1].verified_at, fixture().events[0].at);
+});
+
+test('deployment mismatches and missing deployment configuration fail atomically', async t => {
+  const f = await disk(t); await writeFile(f.output, 'previous');
+  await writeFile(join(f.journal, 'a.json'), JSON.stringify(fixture()));
+  for (const options of [{ network: 'mainnet' }, { guard: 'other.testnet' }, { network: undefined }, { guard: undefined }, { network: 'localnet' }, { guard: 'bad/id' }]) {
+    await assert.rejects(exportEvidence({ ...f, ...options }));
+    assert.equal(await readFile(f.output, 'utf8'), 'previous');
+  }
+  const other = fixture(); other.intent.payment.request_id = 'other'; other.intent.guard = 'other.testnet';
+  await writeFile(join(f.journal, 'b.json'), JSON.stringify(other));
+  await assert.rejects(exportEvidence(f));
+  other.intent.guard = 'guard.testnet'; other.intent.network = 'mainnet';
+  await writeFile(join(f.journal, 'b.json'), JSON.stringify(other));
+  await assert.rejects(exportEvidence(f));
+  assert.equal(await readFile(f.output, 'utf8'), 'previous');
+});
+
+test('untrusted enrichment and missing observation timestamps never fabricate verification', () => {
+  const e = fixture();
+  Object.assign(e.intent.payment, { scenario: 'A', token_decimals: 6, proposal_id: '2', policy_id: '2', recipient_balance_after: '40000000' });
+  for (const at of [undefined, 'invalid', '2026-02-30T10:00:00.000Z']) {
+    e.events[0].at = at;
+    const r = project(e);
+    assert.equal(r.status, 'settled'); assert.equal(r.verified_at, null);
+    for (const k of ['scenario', 'token_decimals', 'proposal_id', 'policy_id', 'recipient_balance_after']) assert.equal(r[k], null);
+  }
+  e.events[0].data.receipts_outcome[1].outcome.receipt_ids = [guardReceipt];
+  assert.equal(project(e).status, 'reserved');
+});
+
+
+// All RPCs are mocked; no test sends a transaction or reads a live journal.
+import { enrichEvidence, evidenceRpc } from '../scripts/verify-payment-evidence.mjs';
+function mockRpc(data, body, calls = []) {
+  return async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'status') return { chain_id: 'testnet' };
+    if (method === 'tx_status') return structuredClone(data);
+    if (method === 'EXPERIMENTAL_receipt') return structuredClone(body);
+    throw new Error('Unexpected RPC method');
+  };
+}
+test('read-only enrichment fetches actual missing bodies, verifies FINAL transfer and preserves journal', async t => {
+  const f = await disk(t), e = fixture(), calls = [];
+  const data = structuredClone(e.events[0].data), body = data.receipts[0];
+  delete data.receipts; delete e.events[0].data.receipts;
+  assert.equal(project(e).status, 'pending');
+  const original = JSON.stringify(e);
+  await writeFile(join(f.journal, 'invoice-1.json'), original);
+  await exportEvidence(f, { rpc: mockRpc(data, body, calls) });
+  const output = JSON.parse(await readFile(f.output, 'utf8'));
+  assert.equal(output.source, 'runner_journal_rpc');
+  assert.equal(output.records[0].source, 'runner_journal_rpc');
+  assert.equal(output.records[0].status, 'settled');
+  assert.equal(output.records[0].settlement_receipt_id, ftReceipt);
+  assert.equal(new Date(output.records[0].verified_at).toISOString(), output.records[0].verified_at);
+  assert.equal(await readFile(join(f.journal, 'invoice-1.json'), 'utf8'), original);
+  assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status', 'EXPERIMENTAL_receipt']);
+  assert.deepEqual(calls[1].params, { tx_hash: tx, sender_account_id: 'agent.testnet', wait_until: 'FINAL' });
+  assert.deepEqual(calls[2].params, { receipt_id: ftReceipt });
+});
+test('receipt bodies already present need no individual receipt query', async () => {
+  const e = fixture(), calls = [];
+  const enriched = await enrichEvidence(e, mockRpc(e.events[0].data, null, calls));
+  assert.equal(project(enriched).status, 'settled');
+  assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status']);
+});
+test('verified failed FT receipts and mismatched actions remain conservative', async () => {
+  for (const [mutate, expected] of [
+    [d => { d.receipts_outcome[1].outcome.status = { Failure: {} }; }, 'settlement_failed'],
+    [d => { d.receipts[0].receiver_id = 'wrong.testnet'; }, 'pending'],
+    [d => { d.receipts[0].predecessor_id = 'wrong.testnet'; }, 'pending'],
+    ...[{ receiver_id: 'wrong.testnet', amount: '40000000' }, { receiver_id: 'merchant.testnet', amount: '1' }].map(args =>
+      [d => { d.receipts[0].receipt.Action.actions[0].FunctionCall.args = Buffer.from(JSON.stringify(args)).toString('base64'); }, 'pending']),
+  ]) {
+    const e = fixture(), data = structuredClone(e.events[0].data); mutate(data);
+    assert.equal(project(await enrichEvidence(e, mockRpc(data))).status, expected);
+  }
+});
+test('incomplete, nonfinal and contradictory RPC evidence fails without publishing output', async t => {
+  const f = await disk(t), e = fixture();
+  await writeFile(join(f.journal, 'invoice-1.json'), JSON.stringify(e));
+  await writeFile(f.output, 'previous');
+  for (const mutate of [
+    d => { d.final_execution_status = 'EXECUTED'; },
+    d => { d.transaction.hash = 'wrong'; },
+    d => { d.transaction.signer_id = 'wrong.testnet'; },
+    d => { d.receipts_outcome.pop(); },
+    d => { d.receipts_outcome[1].outcome.status = { Unknown: true }; },
+    d => { d.receipts_outcome.push(d.receipts_outcome[0]); },
+    d => { delete d.transaction_outcome; },
+    d => { delete d.receipts; },
+  ]) {
+    const data = structuredClone(e.events[0].data); mutate(data);
+    await assert.rejects(exportEvidence(f, { rpc: mockRpc(data, { receipt_id: guardReceipt }) }));
+    assert.equal(await readFile(f.output, 'utf8'), 'previous');
+  }
+  await assert.rejects(enrichEvidence(e, async () => ({ chain_id: 'mainnet' })));
+  await assert.rejects(enrichEvidence(e, async () => { throw new Error('RPC unavailable'); }));
+  for (const url of ['http://rpc.testnet.near.org', 'https://secret:password@example.com', 'https://example.com/#fragment']) assert.throws(() => evidenceRpc(url));
+});
+
+test('only proven terminal system refunds can accompany a settled FT call', async () => {
+  const e = fixture(), data = e.events[0].data, refund = '4'.repeat(44);
+  data.receipts_outcome[1].outcome.receipt_ids = [refund];
+  data.receipts_outcome.push({ id: refund, outcome: { executor_id: 'agent.testnet', status: { SuccessValue: '' }, receipt_ids: [] } });
+  const body = { receipt_id: refund, predecessor_id: 'system', receiver_id: 'agent.testnet', receipt: { Action: {
+    gas_price: '0', actions: [{ Transfer: { deposit: '123' } }],
+  } } };
+  assert.equal(project(e).status, 'reserved');
+  data.receipts.push(body);
+  assert.equal(project(e).status, 'settled');
+  for (const mutate of [
+    d => { d.receipts[1].predecessor_id = 'token.testnet'; },
+    d => { d.receipts[1].receipt.Action.actions = [{ FunctionCall: { method_name: 'callback' } }]; },
+    d => { d.receipts_outcome[2].outcome.status = { Failure: {} }; },
+    d => { d.receipts_outcome[2].outcome.receipt_ids = [ftReceipt]; },
+  ]) {
+    const copy = structuredClone(e); mutate(copy.events[0].data);
+    assert.equal(project(copy).status, 'reserved');
+  }
+  data.receipts.pop();
+  assert.equal(project(await enrichEvidence(e, mockRpc(data, body))).status, 'settled');
+});

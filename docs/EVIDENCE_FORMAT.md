@@ -1,127 +1,143 @@
-# Payment evidence format v2
+# Payment evidence v2 contract
 
-Status: v1 agreed as the base by the runner owner; v2 adds his changes (provenance per record, policy linkage, receipt-verified settlement). Implemented in `frontend/lib/evidence.ts`. With no feed configured, Payments history, the Overview "blocked" card and the Attack Lab show an explicit empty state, never sample data.
+The exporter (offline by default) emits `payguard.evidence.v2` for the frontend partner.
+Pending policy/proposal IDs are never attached to payments without evidence.
 
-## Why a feed at all
+## Produce evidence
 
-The contract keeps no payment history view, and payments are signed server-side by the runner with the restricted agent key. The runner is the only party that knows every request it sent, including rejected ones. The frontend consumes the runner's records and **re-verifies every record against NEAR RPC**. A record the chain disagrees with is shown as "chain disagrees", never hidden or trusted.
+```sh
+npm run evidence:export -- \
+  --network testnet \
+  --guard guard.testnet \
+  --journal "$HOME/payguard-agent-journal" \
+  --output /absolute/existing/export-directory/payment-evidence.json
+```
 
-## Transport
+`--network` (`testnet` or `mainnet`) and `--guard` (canonical account ID) are
+required deployment identifiers, even for an empty journal. Every entry must
+match both; mixed deployments fail the entire export before replacing output.
+These identifiers scope evidence; they do not independently verify the chain.
+`--journal` and `--output` are required absolute paths. The journal must exist; absence is an
+error, not an empty history. The output parent must exist and output must end in
+`.json`, outside the journal. Existing regular single-link output files may be
+replaced. Journal directory symlinks, entry symlinks/hardlinks, output symlinks and
+hardlinks are refused. Use operator-controlled local directories: this is not a
+defense against a hostile process concurrently replacing ancestor directories.
+The exporter never opens journal files for writing or acquires a runner lock.
+Runner dotfiles (locks/incomplete atomic snapshots) are ignored. Other files must
+be JSON version-1 runner entries. Invalid entries, unsupported versions, duplicate
+request IDs, oversized files (>16 MiB), or unsafe paths fail the entire export.
+The CLI withholds raw errors. Previous output remains intact on input/validation
+failure. Output uses an exclusive temporary file, mode 0600, file fsync, atomic
+rename and directory fsync; failure after rename can mean output was published
+but durability could not be confirmed. Interrupted writes can leave `.evidence-*`
+temporary files in the output directory.
 
-- One JSON document at `NEXT_PUBLIC_EVIDENCE_URL` (static file, R2/S3 object, or runner endpoint), CORS open to the frontend origin, read-only, no secrets. Re-fetched every 15s.
+Without `--rpc`, no RPC calls occur. With `--rpc https://trusted-endpoint`, the
+exporter checks `status.chain_id`, requests `tx_status` at `FINAL` by saved hash
+and signer, and fetches missing linked bodies via `EXPERIMENTAL_receipt`. It checks
+matching transaction identity and complete terminal outcome links before projection.
+Missing/contradictory RPC evidence aborts export and preserves previous output.
+No credentials, signing, broadcasts, journal writes or key/policy changes occur.
+This exporter never invokes the payment runner. Enrichment is held in memory;
+no journal append is needed. RPC exports use `runner_journal_rpc` as envelope and
+record source, and `verified_at` is the completed RPC observation time. Offline
+exports retain `runner_journal` and persisted event timestamps. Offline records from the same journal snapshots have deterministic content and request-ID
+ordering. `generated_at` is the UTC ISO-8601 export time, so exports may differ
+in that field. It is not evidence time and never proves on-chain verification. A concurrent
+runner can replace individual snapshots during the scan: each file is atomic,
+but the export is not a transactionally consistent snapshot of the directory.
 
-## Document
+## JSON and frontend consumption
+
+The file is an object:
 
 ```json
 {
   "schema": "payguard.evidence.v2",
   "network": "testnet",
-  "guard_id": "guard.myvirusmy.testnet",
-  "generated_at": "2026-10-23T09:00:00Z",
-  "source": "payguard-runner 0.2.0 (commit abc1234)",
-  "records": [
-    {
-      "request_id": "demo-a-1",
-      "scenario": "A",
-      "agent_id": "agent.myvirusmy.testnet",
-      "recipient_id": "merchant.myvirusmy.testnet",
-      "token_id": "usdc.fakes.testnet",
-      "token_symbol": "USDC",
-      "token_decimals": 6,
-      "amount": "3000000",
-      "status": "settled",
-      "reason": null,
-      "tx_hash": "<pay tx hash>",
-      "block_height": 274177211,
-      "block_timestamp_ns": "1792632395929417961",
-      "explorer_url": "https://testnet.nearblocks.io/txns/<pay tx hash>",
-      "settlement_receipt_id": "<receipt id of the token's ft_transfer>",
-      "policy_id": null,
-      "proposal_id": "2",
-      "source": "payguard-runner 0.2.0 (commit abc1234)",
-      "verified_at": "2026-10-23T08:59:41Z",
-      "recipient_balance_before": "0",
-      "recipient_balance_after": "3000000",
-      "note": null
-    }
-  ]
+  "guard_id": "guard.testnet",
+  "generated_at": "2026-10-23T10:00:00.000Z",
+  "source": "runner_journal",
+  "records": []
 }
 ```
 
-Document rules (any failure rejects the whole file):
-- `schema` must be `payguard.evidence.v2`.
-- `network` must equal the network the UI reads, `guard_id` must equal the guard the UI reads.
-- `generated_at` ISO 8601; `source` = who wrote this file.
+This empty example is illustrative, not live evidence. Network and guard appear
+only in the envelope. `source` is required both in the envelope and every record.
+Records are
+sorted by request ID using code-unit order. Each record contains:
 
-### Where `source` / `verified_at` live (decision)
+| Field | Type and meaning |
+| --- | --- |
+| request_id | String; business ID, unique within this export |
+| agent_id, recipient_id, token_id | Validated account ID strings from persisted intent |
+| amount | Canonical positive u128 integer string in base units; never a JS number |
+| status | One of the five statuses below |
+| reason | Fixed safe classification code or null; never raw exceptions |
+| tx_hash | Persisted base58 hash or null |
+| explorer_url | Network-specific NearBlocks transaction URL derived from validated hash, or null |
+| settlement_receipt_id | Verified successful FT receipt ID or null |
+| source | `runner_journal` or `runner_journal_rpc` |
+| verified_at | Required key: UTC ISO timestamp of persisted classified observation (offline) or completed RPC observation, or null when absent/invalid/unclassified; not export time or block time |
+| note | Fixed description of uncertainty or verification limits |
+| scenario, token_symbol, token_decimals | Currently null; scenario may only be A–E or null. Runner has no authoritative scenario/token metadata |
+| block_height, block_timestamp_ns | Currently null; no verified block header enrichment |
+| recipient_balance_before, recipient_balance_after | Currently null; no historical balance evidence |
+| policy_id, proposal_id | Currently null; policy_id needs independent contract evidence; proposal_id must be a decimal string or null, never a number |
 
-**Per record, required.** Records can come from different runner versions and verification passes (a file is typically appended to over several runs), so one document-level timestamp would misdate older records. The document also carries its own `source` + `generated_at`, describing the file write, not the verification.
+Do not infer symbols/decimals from account names, USDC assumptions or UI defaults.
+Display unknown metadata as unknown and amount as a base-unit string. Future
+enrichment needs a versioned evidence source with explicit provenance; arbitrary
+extra fields in a journal are not trusted by this exporter. No sample records are
+injected. Do not seed Attack Lab outcomes from this export.
 
-## Record
+Load the generated JSON via the frontend's configured read-only data endpoint or
+bundled asset; the exporter itself does not serve HTTP or copy files into the
+frontend. Validate `schema === "payguard.evidence.v2"`, expected network/guard, all required
+record keys (including nullable keys), array shape and unique request IDs before
+rendering. Replace the displayed snapshot atomically, rather than appending rows
+on every refresh. Treat request IDs as scoped to this configured journal; a future
+multi-journal integration needs a network/guard/request composite identity.
+Render strings as text, never HTML. Missing/null fields display “Unknown” or “—”.
+`records: []` means “No persisted payment evidence available”; it does not prove
+there have been no on-chain payments. A failed fetch, invalid JSON, unsupported
+version or exporter error is a data error, not an empty history. If retaining a
+previous snapshot after refresh failure, visibly label it stale. Do not show a
+success badge for null, pending, reserved, or a runner's `succeeded` label.
 
-| field | type | meaning |
-|---|---|---|
-| `request_id` | string | the `request_id` sent to `pay` (1-64 chars, `[A-Za-z0-9_-]`) |
-| `scenario` | `"A"`..`"E"` or `null` | Attack Lab scenario; `null` for ordinary payments |
-| `agent_id` | string | signer of the `pay` transaction |
-| `recipient_id` | string | recipient passed to `pay` |
-| `token_id` | string | token contract passed to `pay` |
-| `token_symbol`, `token_decimals` | string, integer | from the token's `ft_metadata` |
-| `amount` | string | **base units**, decimal string, exactly as sent |
-| `status` | enum | see below |
-| `reason` | string or `null` | REQUIRED for `rejected` (contract code); for `settlement_failed`, the token's failure text |
-| `tx_hash` | string | the `pay` transaction. Rejections must be real submitted transactions |
-| `block_height`, `block_timestamp_ns` | integer / string or `null` | block of the transaction |
-| `explorer_url` | string | nearblocks link |
-| `settlement_receipt_id` | string or `null` | receipt id of the token's `ft_transfer`. **REQUIRED for `settled`**; recommended for `settlement_failed` |
-| `policy_id` | string or `null` | reserved; the contract has no policy id today, send `null` |
-| `proposal_id` | decimal string or `null` | policy proposal that produced the active policy at pay time, where known |
-| `source` | string | who verified THIS record (runner id + commit) |
-| `verified_at` | ISO 8601 | when that runner verified it |
-| `recipient_balance_before` / `_after` | string or `null` | optional, base units via `ft_balance_of`; shown as "reported by the runner", not chain-verified |
-| `note` | string or `null` | free text |
+## Status rules and verification limits
 
-### `status` values
+Offline classification requires a persisted reconciliation/broadcast outcome with matching
+transaction hash, signer and guard and `final_execution_status: FINAL`. The latest
+such outcome event is examined. The transaction outcome must link to the guard
+receipt by `receipt_ids`; the guard receipt executor must match the guard.
 
-| value | meaning | required proof |
-|---|---|---|
-| `rejected` | the guard's `pay` receipt panicked; nothing reserved, nothing moved | `reason` = contract code |
-| `pending` | submitted, outcome not final | none |
-| `reserved` | guard authorized + counted against today's limit; no ft_transfer receipt found | none; never shown as paid |
-| `settlement_failed` | reserved, and the token's `ft_transfer` receipt FAILED. Reservation is not released (no callback) | the failed receipt (id recommended) |
-| `settled` | reserved, and the token's `ft_transfer` to the recipient SUCCEEDED | `settlement_receipt_id`; balance delta optional |
+| Status | Required evidence |
+| --- | --- |
+| rejected | Linked guard receipt has explicit `Failure`; reason `guard_execution_failed`. This includes guard execution errors, not necessarily a specific policy rejection. |
+| reserved | Successful guard receipt links to an exact single `ft_transfer` action from guard to configured token, with matching receiver and base-unit amount. FT completion is unverified. |
+| pending | Default for prepared, signed, uncertain, missing, nonfinal, mismatched or insufficient evidence, including runner `succeeded`/`failed` without sufficient receipts. Never relabel an unknown outcome as rejected. |
+| settled | Reserved evidence plus matching token executor's FT receipt has `SuccessValue`, no child receipts except verified successful system refunds, and a valid receipt ID in the persisted FINAL outcome. Guard success or budget reservation alone is insufficient. |
+| settlement_failed | Reserved evidence plus matching token executor's FT receipt has explicit `Failure`; reason `ft_transfer_failed`. Reservation may remain consumed. |
 
-A successful guard transaction alone is never `settled`. Authorization and reservation happen in the same receipt (`reserve()`), so they are one state.
+Settlement is independently checked at the FT receipt level rather than inferred
+from the guard transaction's result. This checks recorded or freshly fetched RPC evidence, not independent RPC-provider consensus, cryptographic proof validation,
+token code auditing or balance reconciliation. It trusts the journal provenance,
+RPC finality reporting and token semantics. Tokens that spawn contract continuations remain reserved. Protocol refunds are
+accepted only with a real linked body: `system` predecessor, zero gas price,
+single native Transfer to the agent, and a matching successful leaf outcome.
+Missing refund bodies never count as proof. Submission RPC responses may omit action-bearing `receipts`; offline exports stay
+pending even if the runner records success. Opt-in read-only RPC verification can
+supply real bodies without changing the journal. See
+[payment-runner.md](payment-runner.md#read-only-payment-evidence-export) for the command
+and the [NEAR RPC method reference](https://docs.near.org/api/rpc/transactions). Raw logs and failure text are never exported.
 
-## How the frontend verifies a record
+## Frontend partner confirmation needed
 
-`EXPERIMENTAL_tx_status(tx_hash, agent_id, wait_until=FINAL)`, then:
-
-1. tx not sent to `guard_id`, or not signed by `agent_id` → **not verified**.
-2. `settled` with no `settlement_receipt_id` → **not verified** (the parser already rejects such a file).
-3. a guard receipt failed → chain status `rejected`, code from the failure.
-4. otherwise look for the settlement receipt: `predecessor_id == guard_id`, `receiver_id == token_id`, `FunctionCall ft_transfer` with args `receiver_id == recipient_id` and `amount == amount`.
-   - not found → `reserved` (or `pending` if the tx isn't final)
-   - found, outcome Failure → `settlement_failed`
-   - found, outcome success → `settled`
-5. **verified on chain** only when the chain status equals the record's status, the rejection code matches, and (for `settled` / `settlement_failed` with an id) the receipt id equals the one found. Anything else → **chain disagrees**, with the difference named.
-
-Regular RPC keeps a couple of days; set `NEXT_PUBLIC_NEAR_ARCHIVAL_RPC` for older evidence, otherwise old rows show "not verified" instead of being trusted.
-
-## Attack Lab mapping
-
-| scenario | runner action | expected record |
-|---|---|---|
-| A | pay 3 USDC to an allowlisted merchant | `settled` + `settlement_receipt_id`, ideally balances before/after |
-| B | pay 15 USDC with a 5 USDC cap | `rejected`, `max_per_payment` |
-| C | pay a non-allowlisted account | `rejected`, `unapproved_recipient` |
-| D | pay until the daily limit is used, then once more | several `settled`, the last `rejected`, `daily_limit` |
-| E | re-send an already used `request_id` | `rejected`, `duplicate_request` |
-
-Prerequisite: an ACTIVE policy for the token. The live guard has none today (proposal #2 pending), so every pay call fails with `unknown_token` until it is activated.
-
-## Open questions
-
-1. Hosting: static JSON committed after a run, or a live endpoint?
-2. D as one record per payment (assumed) or a summary record?
-3. Guard/exit `ft_balance_of` snapshots for the sweep demo?
+- Confirm how to supply/host the generated asset and refresh/stale-state behavior.
+- Confirm how authoritative A–E scenario evidence will be supplied for transaction history and Attack Lab; the runner
+  has no authoritative scenario field and the exporter will not guess one.
+- Confirm the provenance contract for future token metadata, block headers,
+  historical balances and active policy/proposal IDs. Proposal #2 alone must not
+  be displayed as an active payment policy.
