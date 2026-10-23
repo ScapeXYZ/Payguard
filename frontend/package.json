@@ -4,7 +4,7 @@
   "private": true,
   "description": "Frontend for Payguard, a NEAR payment guard for AI agents. 4 screens: setup, payments + caps, guardian + recovery, emergency sweep.",
   "scripts": {
-    "test": "node tests/tx-safety.test.mjs",
+    "test": "node tests/tx-safety.test.mjs && node tests/evidence-compat.test.mjs",
     "dev": "next dev",
     "build": "next build",
     "start": "next start"

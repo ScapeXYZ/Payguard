@@ -11,7 +11,7 @@ import { ftBalance } from "@/lib/near-rpc";
 import { useTick, useView } from "@/lib/use-guard";
 import { useToken } from "@/lib/use-token";
 import { useWallet } from "@/lib/wallet";
-import { EVIDENCE_URL, loadEvidence } from "@/lib/evidence";
+import { EMPTY_EVIDENCE_TEXT, EVIDENCE_URL, loadEvidence } from "@/lib/evidence";
 import { useVerified } from "@/components/payment-history";
 import { CONTRACT_ERRORS } from "@/lib/errors";
 import { cn, remaining, short } from "@/lib/utils";
@@ -41,7 +41,7 @@ function Overview({ config }: { config: Config }) {
   const verified = useVerified(ev.data, reported);
   // Definitive counts only from chain-verified rejections, keyed by the code read from the guard receipt.
   const confirmed = (reported ?? []).map((r) => verified(r)).filter((v) => v?.state === "verified" && v.onchain === "rejected");
-  const byReason = confirmed.reduce<Record<string, number>>((a, v) => { const k = (v?.state === "verified" && v.reason) || "no code"; a[k] = (a[k] ?? 0) + 1; return a; }, {});
+  const byReason = confirmed.reduce<Record<string, number>>((a, v) => { const k = (v?.state === "verified" && v.chainCode) || "no code"; a[k] = (a[k] ?? 0) + 1; return a; }, {});
   const unconfirmed = (reported?.length ?? 0) - confirmed.length;
   const attention = [
     pending.data && { t: `Policy change #${pending.data.proposal_id} pending`, d: remaining(pending.data.activate_after), href: "/payments/" },
@@ -82,13 +82,15 @@ function Overview({ config }: { config: Config }) {
         <Card>
           <CardHeader><CardTitle className="flex items-center gap-2"><Ban className="size-5 text-red-400" /> What has been blocked</CardTitle><CardDescription>Contract rejections from the payment runner&apos;s evidence.</CardDescription></CardHeader>
           <CardContent className="space-y-2 text-sm">
+            {ev.stale && ev.data && <p className="text-xs text-amber-300">Stale snapshot: the latest evidence refresh failed{ev.error ? ` (${ev.error})` : ""}.</p>}
             {!EVIDENCE_URL || IS_MOCK ? <p className="text-muted-foreground">No evidence feed connected yet, so nothing is claimed here. Rejections will appear once the runner publishes verified records.</p>
               : ev.error && !ev.data ? <p className="text-red-300">Evidence feed unavailable: {ev.error}</p>
               : !ev.data ? <p className="text-muted-foreground">Loading evidence...</p>
-              : !reported?.length ? <p className="text-muted-foreground">No blocked payments in the evidence feed yet.</p>
+              : ev.data.records.length === 0 ? <p className="text-muted-foreground">{EMPTY_EVIDENCE_TEXT}. An empty export doesn&apos;t prove there were no on-chain payments.</p>
+              : !reported?.length ? <p className="text-muted-foreground">No rejected payments in the persisted evidence.</p>
               : <>
-                  {Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n} verified</Badge></div>)}
-                  {unconfirmed > 0 && <p className="text-xs text-muted-foreground">Runner reports {unconfirmed} more rejection{unconfirmed === 1 ? "" : "s"} not (yet) verified on chain; not counted.</p>}
+                  {Object.entries(byReason).map(([k, n]) => <div key={k} className="flex justify-between"><span>{k === "no code" ? "Guard execution failed (no contract code in the receipt)" : CONTRACT_ERRORS[k]?.replace(/^Blocked: /, "") ?? k}</span><Badge variant="danger">{n} verified</Badge></div>)}
+                  {unconfirmed > 0 && <p className="text-xs text-muted-foreground">Runner reports {unconfirmed} more rejection{unconfirmed === 1 ? "" : "s"} not verified on chain; not counted.</p>}
                 </>}
             <Button asChild size="sm" variant="outline"><Link href="/attack-lab/"><FlaskConical /> Attack Lab</Link></Button>
           </CardContent>
