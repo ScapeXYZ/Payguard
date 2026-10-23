@@ -1,6 +1,5 @@
 // Pure classification of an RPC EXPERIMENTAL_tx_status result. No network.
-// A transaction counts as confirmed only when the transaction AND every receipt
-// executed by the guard succeeded. Downstream token receipts are reported separately,
+// A transaction counts as failed when the transaction or its ROOT guard receipt failed. Downstream token receipts are reported separately,
 // because a guard call can succeed while a later ft_transfer fails.
 import type { ExecStatus, ReceiptOutcome, TxStatus } from "./near-rpc";
 import { contractErrorCode, describeFailure } from "./errors";
@@ -52,10 +51,13 @@ export function classifyTx(tx: TxStatus, guardId: string): Outcome {
     return { status: "failed", events, downstreamFailures, finality: tx.final_execution_status,
       failure: { code: contractErrorCode(f), message: describeFailure(f), receiptId: tx.transaction_outcome.id, executor: tx.transaction_outcome.outcome.executor_id } };
   }
+  // Review N2: only the tx's ROOT receipt executed by the guard speaks for the guard call. Any
+  // other failed receipt (incl. a later guard-executed callback) is a downstream failure.
+  const roots = tx.transaction_outcome.outcome.receipt_ids ?? [];
   for (const r of tx.receipts_outcome ?? []) {
     const s = r.outcome.status;
     if (!isFailure(s)) continue;
-    if (r.outcome.executor_id === guardId) {
+    if (r.outcome.executor_id === guardId && roots.includes(r.id)) {
       return { status: "failed", events, downstreamFailures, finality: tx.final_execution_status,
         failure: { code: contractErrorCode(s.Failure), message: describeFailure(s.Failure), receiptId: r.id, executor: r.outcome.executor_id } };
     }

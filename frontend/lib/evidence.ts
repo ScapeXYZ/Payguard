@@ -4,9 +4,8 @@
 // RPC and the status re-derived from the chain with the exporter's own receipt rules.
 // A record with no tx_hash can't be re-checked and is always "not verified".
 import { NETWORK, txStatus, type TxReceipt, type TxStatus } from "./near-rpc";
-import { classifyTx } from "./tx-outcome";
 import { contractErrorCode, describeFailure } from "./errors";
-import { bindPayCall } from "./pay-binding";
+import { bindPayCall, rootOutcome } from "./pay-binding";
 import { duplicateTxHash, isDecimal, isTimestampNs } from "./evidence-view";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
@@ -206,33 +205,28 @@ export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string
   return v.state === "unverifiable" ? { state: "unavailable", why: `${NO_VERIFIED_AT}; chain lookup also failed: ${v.why}`, chain: null } : v;
 }
 
-// The guard receipt's own Failure (not the tx-level status, not another account's receipt).
-function guardReceiptFailure(tx: TxStatus, guardId: string): { code: string | null; text: string } | null {
-  const g = (tx.receipts_outcome ?? []).find((o) => o.outcome.executor_id === guardId && isObj(o.outcome.status) && "Failure" in o.outcome.status);
-  if (!g) return null;
-  const f = (g.outcome.status as { Failure: unknown }).Failure;
-  return { code: contractErrorCode(f), text: describeFailure(f) };
-}
-
 function checkChain(r: EvidenceRecord, tx: TxStatus, guardId: string, agentId: string | null | undefined): Verification {
   // Review F3: the tx must be exactly the configured agent's pay call for THIS request/token/recipient/amount.
   const bind = bindPayCall(tx, { ...r, tx_hash: r.tx_hash ?? "" }, guardId, agentId);
   if (!bind.ok) return { state: "unverifiable", why: bind.why };
   if (r.status === "settled" && !r.settlement_receipt_id) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
 
-  const o = classifyTx(tx, guardId);
+  // Review N2: the outcome is the BOUND root pay receipt's own. Rejection, generic or specific,
+  // and any code come only from THAT receipt's Failure; a later failed guard receipt never counts.
+  const root = rootOutcome(tx, bind.guardReceiptId);
   let onchain: PaymentStatus; let chainCode: string | null = null; let chainFailureText: string | null = null; let st: Settlement | null = null; let guardFailed = false;
-  if (o.status === "failed") {
-    // Code ONLY when parsed from the guard receipt's Failure; no guard receipt = no code.
-    const gf = guardReceiptFailure(tx, guardId);
-    onchain = "rejected"; guardFailed = !!gf; chainCode = gf?.code ?? null; chainFailureText = gf && !gf.code ? gf.text : null;
-  } else {
+  if (root.kind === "failure") {
+    chainCode = contractErrorCode(root.failure);
+    onchain = "rejected"; guardFailed = true; chainFailureText = chainCode ? null : describeFailure(root.failure);
+  } else if (root.kind === "pending") onchain = "pending";
+  else {
+    // Review N4, docs/EVIDENCE_FORMAT.md l112-113: reserved needs the exact matching ft_transfer;
+    // no matching transfer evidence = pending, never reserved.
     st = findSettlement(tx, r, guardId);
-    if (st?.result === "failed") { onchain = "settlement_failed"; chainFailureText = st.message; }
-    else if (st?.result === "settled") onchain = "settled";
-    else if (st) onchain = "reserved";          // transfer issued, completion unverified
-    else if (o.status === "pending") onchain = "pending";
-    else onchain = "reserved";                  // guard succeeded, no matching transfer found
+    if (!st) onchain = "pending";
+    else if (st.result === "failed") { onchain = "settlement_failed"; chainFailureText = st.message; }
+    else if (st.result === "settled") onchain = "settled";
+    else onchain = "reserved";                  // matching transfer issued, completion unverified
   }
   const sid = st?.receiptId ?? null;
   const base: ChainResult = { onchain, reason: r.reason, chainCode, chainFailureText, settlementReceiptId: sid };
