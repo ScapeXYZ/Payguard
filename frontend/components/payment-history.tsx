@@ -131,7 +131,7 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
             )}
           </>
         )}
-        <p className="text-xs text-muted-foreground">&quot;Reserved&quot; means the guard approved the payment and counted it against today&apos;s limit. &quot;Settled&quot; means the token transfer itself also succeeded. A reservation is never released if the transfer later fails. A row is verified as settled only when the agent&apos;s pay call matches this request and the token&apos;s own ft_transfer receipt succeeded; a successful guard call alone stays &quot;reserved&quot;.</p>
+        <p className="text-xs text-muted-foreground">&quot;Reserved&quot; means the guard approved the payment and counted it against today&apos;s limit. &quot;Settled&quot; means the token transfer itself also succeeded. A reservation is never released if the transfer later fails. A row is verified as settled only when the agent&apos;s pay call matches this request and the token&apos;s own ft_transfer receipt succeeded; a successful guard call with no matching ft_transfer receipt stays &quot;pending&quot;.</p>
       </CardContent>
     </Card>
   );

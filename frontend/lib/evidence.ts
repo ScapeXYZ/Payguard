@@ -3,9 +3,8 @@
 // RPC, the status is re-derived from the chain, and "settled" additionally requires the
 // token's ft_transfer receipt named in the record to exist and to have succeeded.
 import { NETWORK, txStatus, type TxReceipt, type TxStatus } from "./near-rpc";
-import { classifyTx } from "./tx-outcome";
 import { contractErrorCode, describeFailure } from "./errors";
-import { bindPayCall } from "./pay-binding";
+import { bindPayCall, rootOutcome } from "./pay-binding";
 import { duplicateTxHash, isDecimal, isDecimals, isTimestampNs, isU128 } from "./evidence-view";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
@@ -142,12 +141,6 @@ export function findSettlement(tx: TxStatus, r: Pick<EvidenceRecord, "token_id" 
   return { receiptId: match.receipt_id, result: "pending", message: null };
 }
 
-// The guard receipt's own Failure is the only place a contract code may come from.
-function guardReceiptCode(tx: TxStatus, guardId: string): string | null {
-  const g = (tx.receipts_outcome ?? []).find((o) => o.outcome.executor_id === guardId && isObj(o.outcome.status) && "Failure" in o.outcome.status);
-  return g ? contractErrorCode((g.outcome.status as { Failure: unknown }).Failure) : null;
-}
-
 // Pure: re-derive the payment status from an RPC result and compare with the record.
 // agentId = the guard's configured agent (get_config), never taken from the record.
 export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string, agentId: string | null | undefined): Verification {
@@ -156,17 +149,20 @@ export function verifyAgainstTx(r: EvidenceRecord, tx: TxStatus, guardId: string
   if (!bind.ok) return { state: "unverifiable", why: bind.why };
   if (r.status === "settled" && !str(r.settlement_receipt_id)) return { state: "unverifiable", why: "claims settled but names no settlement receipt; a guard success alone is never settlement" };
 
-  const o = classifyTx(tx, guardId);
+  // Review N2: the outcome is the BOUND root pay receipt's own; the code only from its Failure.
+  const root = rootOutcome(tx, bind.guardReceiptId);
   let onchain: PaymentStatus; let reason: string | null = null; let st: Settlement | null = null;
-  if (o.status === "failed") { onchain = "rejected"; reason = guardReceiptCode(tx, guardId); }  // never a message as a code
-  else if (o.status === "pending" && !(st = findSettlement(tx, r, guardId))) onchain = "pending";
+  if (root.kind === "failure") { onchain = "rejected"; reason = contractErrorCode(root.failure); }  // never a message as a code
+  else if (root.kind === "pending") onchain = "pending";
   else {
-    st = st ?? findSettlement(tx, r, guardId);
-    // Guard committed the reservation. Only the token's own receipt decides settlement.
-    if (!st) onchain = o.status === "pending" ? "pending" : "reserved";
+    // Review N4 (docs/EVIDENCE_FORMAT.md l112-113): reserved needs the exact matching ft_transfer
+    // receipt; no matching transfer evidence = pending, never reserved. Only the token's own
+    // receipt decides settlement; a transfer whose completion is unverified stays reserved.
+    st = findSettlement(tx, r, guardId);
+    if (!st) onchain = "pending";
     else if (st.result === "failure") { onchain = "settlement_failed"; reason = st.message; }
     else if (st.result === "success") onchain = "settled";
-    else onchain = "pending";
+    else onchain = "reserved";
   }
   const sid = st?.receiptId ?? null;
   const base = { onchain, reason, settlementReceiptId: sid };
