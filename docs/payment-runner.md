@@ -101,7 +101,11 @@ paths (for example, use `$HOME/...` when quoting rather than a literal `~`).
    An observed transaction followed by `UNKNOWN_TRANSACTION` at `FINAL` is
    inconsistent evidence: it stays unresolved and cannot authorize submission.
 6. Final success requires matching transaction identity, `FINAL`, terminal receipt
-   outcomes and a successful final result. Any receipt failure is terminal failure.
+   outcomes and a finalized receipt graph proving the exact requested NEP-141
+   `ft_transfer` to the configured token contract and recipient for the exact
+   amount. The transfer execution must succeed; otherwise settlement remains
+   unverified (or is reported as final failure when the matching transfer fails).
+   Any receipt failure is terminal failure.
    Subsequent invocations return the recorded terminal result without broadcasting.
 
 A successful `send_tx` submission alone is not payment success. The runner uses

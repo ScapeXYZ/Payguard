@@ -6,29 +6,13 @@ import { open, lstat, realpath, readdir, rename, unlink } from 'node:fs/promises
 import { resolve, dirname, basename, join, sep, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { findMatchingPaymentTransfer, verifyPaymentTransfer } from './verify-payment-transfer.mjs';
 
 const fail = () => { throw new Error('Invalid evidence input or unsafe output path'); };
 const matches = (v, re) => typeof v === 'string' && re.exec(v)?.[0] === v;
 const id = v => matches(v, /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/) && v.length >= 2 && v.length <= 64;
 const hash = v => matches(v, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/) ? v : null;
 const success = s => s && (Object.hasOwn(s, 'SuccessValue') || Object.hasOwn(s, 'SuccessReceiptId'));
-
-// A successful FT call may produce protocol gas refunds. Verify their bodies
-// and terminal outcomes explicitly; arbitrary contract continuations stay reserved.
-function onlyRefundChildren(ft, data, agent) {
-  return Array.isArray(ft?.outcome?.receipt_ids) && ft.outcome.receipt_ids.every(child => {
-    const bodies = (data.receipts ?? []).filter(r => r?.receipt_id === child);
-    const outcome = data.receipts_outcome.find(o => o.id === child)?.outcome;
-    if (bodies.length !== 1) return false;
-    const r = bodies[0], action = r.receipt?.Action;
-    const transfer = action?.actions?.[0]?.Transfer;
-    return r.predecessor_id === 'system' && r.receiver_id === agent &&
-      action.gas_price === '0' && action.actions.length === 1 &&
-      matches(transfer?.deposit, /^[1-9][0-9]*$/) &&
-      outcome?.executor_id === agent && Object.hasOwn(outcome.status ?? {}, 'SuccessValue') &&
-      Array.isArray(outcome.receipt_ids) && outcome.receipt_ids.length === 0;
-  });
-}
 
 export function project(entry) {
   const i = entry?.intent, p = i?.payment;
@@ -54,23 +38,14 @@ export function project(entry) {
     if (guard && Object.hasOwn(guard.outcome.status ?? {}, 'Failure')) {
       r.status = 'rejected'; r.reason = 'guard_execution_failed';
     } else if (guard && success(guard.outcome.status)) {
-      const transfer = (d.receipts ?? []).find(receipt => {
-        if (!guard.outcome.receipt_ids?.includes(receipt.receipt_id) || receipt.predecessor_id !== i.guard || receipt.receiver_id !== p.token_id) return false;
-        const actions = receipt.receipt?.Action?.actions;
-        if (!Array.isArray(actions) || actions.length !== 1) return false;
-        const call = actions[0]?.FunctionCall;
-        if (call?.method_name !== 'ft_transfer') return false;
-        try {
-          const args = JSON.parse(Buffer.from(call.args, 'base64').toString('utf8'));
-          return args.receiver_id === p.recipient_id && args.amount === p.amount;
-        } catch { return false; }
-      });
-      if (transfer) {
+      const transferStatus = verifyPaymentTransfer(d, { guard: i.guard, agent: i.agent, token: p.token_id, recipient: p.recipient_id, amount: p.amount });
+      if (transferStatus !== 'unverified') {
+        const transfer = findMatchingPaymentTransfer(d, { guard: i.guard, token: p.token_id, recipient: p.recipient_id, amount: p.amount });
         r.status = 'reserved';
         const ft = outcomes.find(o => o.id === transfer.receipt_id && o.outcome?.executor_id === p.token_id);
-        if (Object.hasOwn(ft?.outcome?.status ?? {}, 'Failure')) {
+        if (transferStatus === 'failed') {
           r.status = 'settlement_failed'; r.reason = 'ft_transfer_failed';
-        } else if (Object.hasOwn(ft?.outcome?.status ?? {}, 'SuccessValue') && onlyRefundChildren(ft, d, i.agent)) {
+        } else if (transferStatus === 'succeeded') {
           r.status = 'settled'; r.settlement_receipt_id = hash(ft.id);
           // A receipt ID must be well formed before it can certify settlement.
           if (!r.settlement_receipt_id) r.status = 'pending';
