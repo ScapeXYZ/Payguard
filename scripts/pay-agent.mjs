@@ -6,6 +6,7 @@ import { resolve, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { KeyPair, InMemorySigner, transactions, utils } from 'near-api-js';
+import { verifyPaymentTransfer } from './verify-payment-transfer.mjs';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const GAS = 80_000_000_000_000n;
@@ -173,7 +174,9 @@ export function classify(outcome, entry) {
   const statuses = [outcome.status, outcome.transaction_outcome.outcome.status, ...outcome.receipts_outcome.map(r => r.outcome?.status)];
   if (statuses.some(s => !s || typeof s !== 'object' || !['SuccessValue', 'SuccessReceiptId', 'Failure'].some(k => Object.hasOwn(s, k)))) return 'uncertain';
   if (statuses.some(s => Object.hasOwn(s, 'Failure'))) return 'failed';
-  return Object.hasOwn(outcome.status, 'SuccessValue') ? 'succeeded' : 'uncertain';
+  const transfer = verifyPaymentTransfer(outcome, { guard: entry.intent.guard, agent: entry.intent.agent,
+    token: entry.intent.payment.token_id, recipient: entry.intent.payment.recipient_id, amount: entry.intent.payment.amount });
+  return transfer === 'failed' ? 'failed' : transfer === 'succeeded' && Object.hasOwn(outcome.status, 'SuccessValue') ? 'succeeded' : 'uncertain';
 }
 function unknownTransaction(error) {
   // Structured unknown is a lookup result, never proof of non-execution. Do not infer from text.
@@ -300,7 +303,7 @@ function verifySignedEntry(entry, key) {
 function summary(entry) {
   return { request_id: entry.intent.payment.request_id, state: entry.state, transaction_hash: entry.transaction_hash ?? null, recovery: entry.recovery,
     note: entry.state === 'failed' ? 'Final transaction/receipt failure; reservation may remain. Do not create a new business ID to bypass replay protection.' :
-      entry.state === 'uncertain' ? 'Unresolved. Reconcile this ID; no fresh transaction will be signed.' : undefined };
+      entry.state === 'uncertain' ? 'Settlement remains unverified. Reconcile this ID; no fresh transaction will be signed.' : undefined };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {

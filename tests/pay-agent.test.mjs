@@ -20,9 +20,16 @@ async function fixture(t) {
   await writeFile(c.credentials, JSON.stringify({ account_id: c.agent, public_key: key.getPublicKey().toString(), private_key: key.toString() }), { mode: 0o600 });
   const calls = [];
   const state = { permission: { FunctionCall: { receiver_id: c.guard, method_names: ['pay'], allowance: '1000000000000000000000000' } }, lookup: null, send: null };
+  const transferArgs = () => Buffer.from(JSON.stringify({ receiver_id: c.recipient, amount: c.amount })).toString('base64');
   const outcome = (hash, overrides = {}) => ({ final_execution_status: 'FINAL', transaction: { hash, signer_id: c.agent, receiver_id: c.guard },
-    status: { SuccessValue: '' }, transaction_outcome: { id: hash, outcome: { status: { SuccessReceiptId: 'receipt-1' } } },
-    receipts_outcome: [{ id: 'receipt-1', block_hash: blockHash, outcome: { executor_id: c.guard, logs: [], status: { SuccessValue: '' } } }], receipts: [{ receipt_id: 'receipt-1' }], ...overrides });
+    status: { SuccessValue: '' }, transaction_outcome: { id: hash, outcome: { status: { SuccessReceiptId: 'receipt-1' }, receipt_ids: ['receipt-1'] } },
+    receipts_outcome: [
+      { id: 'receipt-1', block_hash: blockHash, outcome: { executor_id: c.guard, logs: [], status: { SuccessReceiptId: 'receipt-2' }, receipt_ids: ['receipt-2'] } },
+      { id: 'receipt-2', block_hash: blockHash, outcome: { executor_id: c.token, logs: [], status: { SuccessValue: '' }, receipt_ids: [] } },
+    ], receipts: [
+      { receipt_id: 'receipt-1' },
+      { receipt_id: 'receipt-2', predecessor_id: c.guard, receiver_id: c.token, receipt: { Action: { actions: [{ FunctionCall: { method_name: 'ft_transfer', args: transferArgs() } }] } } },
+    ], ...overrides });
   const rpc = async (method, params) => {
     calls.push({ method, params });
     if (method === 'status') return { chain_id: state.chain ?? 'testnet', sync_info: { syncing: false } };
@@ -72,7 +79,7 @@ test('signs only pay with exact large integer strings; saves full final evidence
   assert.equal(result.state, 'succeeded');
   const entry = await f.journal();
   assert.equal(entry.intent.payment.amount, f.c.amount);
-  assert.equal(entry.events.at(-1).data.receipts_outcome.length, 1);
+  assert.equal(entry.events.at(-1).data.receipts_outcome.length, 2);
   assert.equal(JSON.stringify(entry).includes(f.key.toString()), false);
   assert.equal(JSON.stringify(result).includes(entry.signed_transaction), false);
   const before = f.calls.length;
@@ -199,6 +206,26 @@ test('final receipt failure overrides outer success; missing evidence stays unce
   f.c.requestId = 'another-business-request';
   f.state.send = async (_, entry) => f.outcome(entry.transaction_hash, { receipts_outcome: [] });
   assert.equal((await runPayment(f.c, { rpc: f.rpc })).state, 'uncertain');
+});
+
+test('final success requires an exact successful token transfer receipt', async t => {
+  const cases = [
+    ['matching transfer', () => {}, 'succeeded'],
+    ['no matching transfer', result => { result.receipts = []; }, 'uncertain'],
+    ['wrong recipient', result => { result.receipts[1].receipt.Action.actions[0].FunctionCall.args = Buffer.from(JSON.stringify({ receiver_id: 'other.testnet', amount: '40000000' })).toString('base64'); }, 'uncertain'],
+    ['wrong amount', result => { result.receipts[1].receipt.Action.actions[0].FunctionCall.args = Buffer.from(JSON.stringify({ receiver_id: 'merchant.testnet', amount: '1' })).toString('base64'); }, 'uncertain'],
+    ['wrong token contract', result => { result.receipts[1].receiver_id = 'other-token.testnet'; }, 'uncertain'],
+    ['failed ft_transfer receipt', result => { result.receipts_outcome[1].outcome.status = { Failure: { ActionError: 'token panic' } }; }, 'failed'],
+  ];
+  for (const [name, alter, expected] of cases) {
+    const f = await fixture(t);
+    f.state.send = async (_, entry) => {
+      const result = f.outcome(entry.transaction_hash);
+      alter(result);
+      return result;
+    };
+    assert.equal((await runPayment(f.c, { rpc: f.rpc })).state, expected, name);
+  }
 });
 test('prepared request resumes after crash before signing; reconcile cannot create an intent', async t => {
   const f = await fixture(t);

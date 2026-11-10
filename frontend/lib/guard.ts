@@ -1,14 +1,14 @@
 // Payguard view-call client.
 // Shapes mirror contract/guard.ts @view methods 1:1 (ScapeXYZ/Payguard main).
-// Defaults to the live testnet guard.myvirusmy.testnet; NEXT_PUBLIC_GUARD_CONTRACT=mock gives mock data. Every view is a real
-// NEAR RPC `call_function` query. Write calls (set_policy, pay, cancel_*,
-// propose_*, activate_*, emergency_sweep) are NOT here: they are wired by the
-// contract author through NEAR Wallet Selector (see lib/wallet.ts).
+// Defaults to the live testnet guard.myvirusmy.testnet. NEXT_PUBLIC_GUARD_CONTRACT=mock
+// gives clearly labelled mock data (never mixed with live reads). Every live view is a
+// real NEAR RPC call_function query. Write calls are signed in lib/wallet.tsx.
+import { NETWORK, view } from "./near-rpc";
 
 export type Config = { owner_id: string; agent_id: string; guardian_id: string; exit_id: string };
 export type TokenPolicy = { max_per_payment: string; daily_limit: string; recipients: string[] };
 export type PendingPolicy = { proposal_id: string; token_id: string; policy: TokenPolicy; activate_after: string };
-export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string; owner_proposed?: boolean };
+export type PendingIdentity = { proposal_id: string; account_id: string; activate_after: string; owner_proposed?: boolean; cold_key_proposed?: boolean };
 export type Spending = { token_id: string; day: string; spent: string };
 
 export interface GuardClient {
@@ -26,29 +26,6 @@ export interface GuardClient {
 export const DAY_NS = 86_400_000_000_000n;
 export const nowNs = () => BigInt(Date.now()) * 1_000_000n;
 
-// ---------- real RPC client ----------
-const NETWORK = (process.env.NEXT_PUBLIC_NEAR_NETWORK ?? "testnet") as "testnet" | "mainnet";
-const RPC = process.env.NEXT_PUBLIC_NEAR_RPC ?? (NETWORK === "mainnet" ? "https://rpc.mainnet.near.org" : "https://test.rpc.fastnear.com");
-
-function b64(s: string) {
-  return typeof window === "undefined" ? Buffer.from(s).toString("base64") : btoa(s);
-}
-
-async function view<T>(contractId: string, method: string, args: object = {}): Promise<T> {
-  const res = await fetch(RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0", id: "payguard-ui", method: "query",
-      params: { request_type: "call_function", finality: "final", account_id: contractId, method_name: method, args_base64: b64(JSON.stringify(args)) },
-    }),
-  });
-  const json = await res.json();
-  if (json.error || json.result?.error) throw new Error(json.error?.message ?? json.result.error);
-  const bytes: number[] = json.result.result;
-  return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes))) as T;
-}
-
 function rpcClient(contractId: string): GuardClient {
   return {
     mode: NETWORK, contractId,
@@ -62,53 +39,56 @@ function rpcClient(contractId: string): GuardClient {
   };
 }
 
-// ---------- mock client (same shapes) ----------
+// ---------- mock client (same shapes, opt-in only, always badged "mock data") ----------
 const H = 3_600_000_000_000n;
 const t0 = nowNs();
 const mock = {
-  config: { owner_id: "temi.testnet", agent_id: "agent.temi.testnet", guardian_id: "guardian.temi.testnet", exit_id: "cold-vault.testnet" },
-  policies: {
-    "usdc.fakes.testnet": { max_per_payment: "50000000", daily_limit: "120000000", recipients: ["openai-credits.testnet", "vercel-billing.testnet", "akash-gpu.testnet"] },
-  } as Record<string, TokenPolicy>,
-  spent: { "usdc.fakes.testnet": "80000000" } as Record<string, string>,
-  pendingPolicy: {
-    proposal_id: "4", token_id: "usdc.fakes.testnet",
-    policy: { max_per_payment: "50000000", daily_limit: "200000000", recipients: ["openai-credits.testnet", "vercel-billing.testnet", "akash-gpu.testnet", "replicate.testnet"] },
-    activate_after: (t0 + 17n * H).toString(),
-  } as PendingPolicy | null,
-  pendingGuardian: { proposal_id: "7", account_id: "new-guardian.testnet", activate_after: (t0 + 9n * H).toString(), owner_proposed: true } as PendingIdentity | null,
-  pendingRecovery: null as PendingIdentity | null,
+  config: { owner_id: "owner.mock.testnet", agent_id: "agent.mock.testnet", guardian_id: "guardian.mock.testnet", exit_id: "exit.mock.testnet" },
+  policies: { "usdc.fakes.testnet": { max_per_payment: "5000000", daily_limit: "20000000", recipients: ["merchant.mock.testnet"] } } as Record<string, TokenPolicy>,
+  pendingPolicy: { proposal_id: "4", token_id: "usdc.fakes.testnet",
+    policy: { max_per_payment: "5000000", daily_limit: "30000000", recipients: ["merchant.mock.testnet", "gpu.mock.testnet"] },
+    activate_after: (t0 + 17n * H).toString() } as PendingPolicy | null,
 };
-
 const mockClient: GuardClient = {
-  mode: "mock", contractId: "payguard.temi.testnet (mock)",
+  mode: "mock", contractId: "guard.mock.testnet",
   get_config: async () => mock.config,
   get_policy: async (t) => mock.policies[t.toLowerCase()] ?? null,
-  get_spending: async (t, day) => ({ token_id: t.toLowerCase(), day: day ?? (nowNs() / DAY_NS).toString(), spent: mock.spent[t.toLowerCase()] ?? "0" }),
+  get_spending: async (t, day) => ({ token_id: t.toLowerCase(), day: day ?? (nowNs() / DAY_NS).toString(), spent: "0" }),
   get_pending_policy: async () => mock.pendingPolicy,
-  get_pending_guardian_change: async () => mock.pendingGuardian,
-  get_pending_owner_recovery: async () => mock.pendingRecovery,
+  get_pending_guardian_change: async () => null,
+  get_pending_owner_recovery: async () => null,
   get_recovery_cooldown: async () => "0",
 };
 
-// Live testnet guard (deployed from main @ #13). NEXT_PUBLIC_GUARD_CONTRACT overrides it; "mock" forces mock data.
+// Live testnet guard. NEXT_PUBLIC_GUARD_CONTRACT overrides it; "mock" forces mock data.
 export const GUARD_CONTRACT_ID = process.env.NEXT_PUBLIC_GUARD_CONTRACT ?? "guard.myvirusmy.testnet";
 export const guard: GuardClient = GUARD_CONTRACT_ID && GUARD_CONTRACT_ID !== "mock" ? rpcClient(GUARD_CONTRACT_ID) : mockClient;
+export const IS_MOCK = guard.mode === "mock";
 
 // Circle native USDC on NEAR testnet (the live guard's policy token).
 export const CIRCLE_USDC_TESTNET = "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af";
-// Tokens the UI tracks (the contract has no token list view).
-export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? (GUARD_CONTRACT_ID === "mock" ? "usdc.fakes.testnet" : CIRCLE_USDC_TESTNET)).split(",").map((s) => s.trim());
-export const TOKEN_META: Record<string, { symbol: string; decimals: number }> = {
+// Tokens the UI offers (the contract has no token list view). Symbol and decimals are
+// NOT taken from here: they are read from each token's own ft_metadata (lib/use-token.ts).
+export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? (IS_MOCK ? "usdc.fakes.testnet" : CIRCLE_USDC_TESTNET)).split(",").map((s) => s.trim()).filter(Boolean);
+// Known-good metadata, used only to flag a mismatch with what the chain returns.
+export const EXPECTED_META: Record<string, { symbol: string; decimals: number }> = {
   "usdc.fakes.testnet": { symbol: "USDC", decimals: 6 },
   [CIRCLE_USDC_TESTNET]: { symbol: "USDC", decimals: 6 },
 };
 
-// Simulated activity for the payments screen. The contract emits no payment
-// history view; real history comes from an indexer (NearBlocks) later.
-export const MOCK_PAYMENTS = [
-  { request_id: "req-1043", recipient_id: "openai-credits.testnet", amount: "40000000", at: Date.now() - 42 * 60_000, status: "paid" },
-  { request_id: "req-1042", recipient_id: "akash-gpu.testnet", amount: "40000000", at: Date.now() - 3 * 3_600_000, status: "paid" },
-  { request_id: "req-1041", recipient_id: "unknown-wallet.testnet", amount: "10000000", at: Date.now() - 4 * 3_600_000, status: "blocked: recipient_not_allowed" },
-  { request_id: "req-1040", recipient_id: "vercel-billing.testnet", amount: "75000000", at: Date.now() - 6 * 3_600_000, status: "blocked: max_per_payment" },
-];
+// ---------- roles ----------
+export type Role = "owner" | "guardian" | "agent" | "exit";
+export function rolesOf(account: string | null | undefined, config: Config | undefined): Role[] {
+  if (!account || !config) return [];
+  const a = account.toLowerCase();
+  const r: Role[] = [];
+  if (a === config.owner_id) r.push("owner");
+  if (a === config.guardian_id) r.push("guardian");
+  if (a === config.agent_id) r.push("agent");
+  if (a === config.exit_id) r.push("exit");
+  return r;
+}
+
+// near-sdk-js requireInit: views on an uninitialised contract fail with this panic.
+export const isUninitialised = (err?: string) => !!err && /must be initialized|not initialized|requireInit|Contract must be init/i.test(err);
+export const isMissingContract = (err?: string) => !!err && /CodeDoesNotExist|does not exist|UNKNOWN_ACCOUNT|AccountDoesNotExist/i.test(err);

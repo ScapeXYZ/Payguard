@@ -77,7 +77,3 @@ export function Progress({ value, className, tone = "default" }: { value: number
 export function Mono({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{children}</code>;
 }
-
-export function WiredByYou({ method }: { method: string }) {
-  return <p className="mt-2 text-xs text-muted-foreground">simulated · <Mono>{method}</Mono> signs via wallet selector, wired by the contract author</p>;
-}
