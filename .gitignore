@@ -1,4 +1,12 @@
 node_modules/
 build/
+dist/
+.next/
+out/
 .near-credentials/
+.env
+.env.*
+!.env.example
+journals/
+*journal*
 *.log

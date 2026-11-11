@@ -93,12 +93,13 @@ function Row({ r, v }: { r: EvidenceRecord; v?: Verification }) {
       reason: reasonText(r.reason),
     };
   } catch (e) {
-    return <tr><td colSpan={7} className="py-2 text-xs text-red-300">Record {String(r?.request_id ?? "?")} couldn&apos;t be displayed: {String((e as Error)?.message ?? e)}</td></tr>;
+    return <tr><td colSpan={8} className="py-2 text-xs text-red-300">Record {String(r?.request_id ?? "?")} couldn&apos;t be displayed: {String((e as Error)?.message ?? e)}</td></tr>;
   }
   return (
     <tr className="align-top">
       <td className="py-2 font-mono text-xs">{r.request_id}{r.scenario && <Badge variant="outline" className="ml-1" title="scenario tag reported by the runner">{r.scenario}</Badge>}</td>
       <td className="font-mono text-xs">{short(r.agent_id, 10)} → {short(r.recipient_id, 10)}</td>
+      <td className="font-mono text-xs">{short(r.token_id, 12)}</td>
       <td title="symbol and decimals as reported by the runner, not read from chain">{cells.amount}</td>
       <td><Badge variant={cells.status.tone}>{cells.status.label}</Badge>{cells.reason && <div className="mt-1 text-xs text-muted-foreground">runner reason: {cells.reason}</div>}</td>
       <td><VerifyBadge v={v} status={r.status} /><VerifyDetail v={v} /><div className="mt-1 text-xs text-muted-foreground" title={r.note ?? undefined}>{r.source}: observed {cells.observed}{r.proposal_id ? ` · proposal #${r.proposal_id}` : ""}</div></td>
@@ -113,7 +114,9 @@ function Row({ r, v }: { r: EvidenceRecord; v?: Verification }) {
 export function PaymentHistory({ tokenId }: { tokenId: string }) {
   const ev = useView(() => loadEvidence(guard.contractId), []);
   const all = ev.data?.records;
-  const records = useMemo(() => all?.filter((r) => r.token_id === tokenId), [all, tokenId]);
+  // Evidence is guard-scoped, not token-picker-scoped: show every persisted payment
+  // for this guard so a multi-token export cannot hide a real record.
+  const records = useMemo(() => all, [all]);
   const verified = useVerified(ev.data, records);
 
   return (
@@ -136,7 +139,7 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
             {ev.data && records && records.length > 0 && (
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[760px] text-sm">
-                  <thead className="text-left text-xs text-muted-foreground"><tr><th className="py-2">Request</th><th>Agent → recipient</th><th>Amount</th><th>Status</th><th>Chain check</th><th>Time (UTC)</th><th>Tx</th></tr></thead>
+                  <thead className="text-left text-xs text-muted-foreground"><tr><th className="py-2">Request</th><th>Agent → recipient</th><th>Token</th><th>Amount</th><th>Status</th><th>Chain check</th><th>Time (UTC)</th><th>Tx</th></tr></thead>
                   <tbody className="divide-y divide-border">
                     {records.map((r) => <Row key={evidenceKey(ev.data!, r)} r={r} v={verified(r)} />)}
                   </tbody>

@@ -65,14 +65,14 @@ export const GUARD_CONTRACT_ID = process.env.NEXT_PUBLIC_GUARD_CONTRACT ?? "guar
 export const guard: GuardClient = GUARD_CONTRACT_ID && GUARD_CONTRACT_ID !== "mock" ? rpcClient(GUARD_CONTRACT_ID) : mockClient;
 export const IS_MOCK = guard.mode === "mock";
 
-// Circle native USDC on NEAR testnet (the live guard's policy token).
+// Circle native USDC on NEAR testnet (available as an explicit override).
 export const CIRCLE_USDC_TESTNET = "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af";
 // Tokens the UI offers (the contract has no token list view). Symbol and decimals are
 // NOT taken from here: they are read from each token's own ft_metadata (lib/use-token.ts).
-export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? (IS_MOCK ? "usdc.fakes.testnet" : CIRCLE_USDC_TESTNET)).split(",").map((s) => s.trim()).filter(Boolean);
+export const TOKENS = (process.env.NEXT_PUBLIC_GUARD_TOKENS ?? "usdc.fakes.testnet").split(",").map((s) => s.trim()).filter(Boolean);
 // Known-good metadata, used only to flag a mismatch with what the chain returns.
 export const EXPECTED_META: Record<string, { symbol: string; decimals: number }> = {
-  "usdc.fakes.testnet": { symbol: "USDC", decimals: 6 },
+  "usdc.fakes.testnet": { symbol: "USDC.e", decimals: 6 },
   [CIRCLE_USDC_TESTNET]: { symbol: "USDC", decimals: 6 },
 };
 

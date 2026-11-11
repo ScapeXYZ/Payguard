@@ -11,7 +11,7 @@ import { loadEvidenceTransaction, onlySystemRefundChildren, validateEvidenceRece
 import { isDecimal, isTimestampNs } from "./evidence-view";
 
 export const EVIDENCE_SCHEMA = "payguard.evidence.v2";
-export const EVIDENCE_URL = process.env.NEXT_PUBLIC_EVIDENCE_URL ?? "";
+export const EVIDENCE_URL = process.env.NEXT_PUBLIC_EVIDENCE_URL ?? "/evidence/payment-evidence-testnet.json";
 export const EMPTY_EVIDENCE_TEXT = "No persisted payment evidence available";
 // Generic exporter class: the guard receipt failed; the specific contract code isn't exported.
 export const GENERIC_GUARD_FAILURE = "guard_execution_failed";

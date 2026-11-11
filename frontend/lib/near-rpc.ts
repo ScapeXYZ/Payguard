@@ -3,8 +3,8 @@
 
 export const NETWORK = (process.env.NEXT_PUBLIC_NEAR_NETWORK ?? "testnet") as "testnet" | "mainnet";
 export const RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC ?? (NETWORK === "mainnet" ? "https://rpc.mainnet.fastnear.com" : "https://test.rpc.fastnear.com");
-// Optional archival node for tx lookups older than the regular node keeps (~2-3 days).
-export const ARCHIVAL_RPC_URL = process.env.NEXT_PUBLIC_NEAR_ARCHIVAL_RPC ?? "";
+// Historical evidence lookups default to the archival node; deployments may override it.
+export const ARCHIVAL_RPC_URL = process.env.NEXT_PUBLIC_NEAR_ARCHIVAL_RPC ?? "https://archival-rpc.testnet.fastnear.com";
 export const EXPLORER = NETWORK === "mainnet" ? "https://nearblocks.io" : "https://testnet.nearblocks.io";
 
 export const txUrl = (hash: string) => `${EXPLORER}/txns/${hash}`;

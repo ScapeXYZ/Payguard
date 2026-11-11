@@ -255,16 +255,17 @@ test('archival fallback repeats the complete read-only verification on one provi
   const mock = readRpc(tx);
   globalThis.fetch = async (url, init) => {
     const request = JSON.parse(init.body); calls.push({ url, method: request.method });
-    if (new URL(url).hostname === 'primary.invalid' && request.method === 'EXPERIMENTAL_receipt') return { ok: false, status: 503 };
+    if (new URL(url).hostname === 'archive.invalid' && request.method === 'EXPERIMENTAL_receipt') return { ok: false, status: 503 };
     return { ok: true, json: async () => ({ jsonrpc: '2.0', id: request.id, result: await mock(request.method, request.params) }) };
   };
   try {
     assert.ok(green(await verifyRecord(record(), guard, agent)));
     assert.deepEqual(calls.map(c => c.method), ['status', 'tx_status', 'EXPERIMENTAL_receipt', 'status', 'tx_status', 'EXPERIMENTAL_receipt', 'EXPERIMENTAL_receipt', 'EXPERIMENTAL_receipt']);
-    assert.ok(calls.slice(3).every(c => new URL(c.url).hostname === 'archive.invalid'));
+    assert.ok(calls.slice(0, 3).every(c => new URL(c.url).hostname === 'archive.invalid'));
+    assert.ok(calls.slice(3).every(c => new URL(c.url).hostname === 'primary.invalid'));
   } finally { globalThis.fetch = previous; }
 });
-test('contradictory primary evidence is never silently replaced by archival evidence', async () => {
+test('contradictory archival evidence is never silently replaced by primary evidence', async () => {
   const previous = globalThis.fetch, calls = [], tx = transaction(); tx.receipts.push(tx.receipts[0]);
   const mock = readRpc(tx);
   globalThis.fetch = async (url, init) => {
@@ -273,7 +274,7 @@ test('contradictory primary evidence is never silently replaced by archival evid
   };
   try {
     assert.equal(green(await verifyRecord(record(), guard, agent)), false);
-    assert.ok(calls.every(url => new URL(url).hostname === 'primary.invalid'));
+    assert.ok(calls.every(url => new URL(url).hostname === 'archive.invalid'));
   } finally { globalThis.fetch = previous; }
 });
 test('feed fetch failure and malformed JSON are data errors, not empty exports', async () => {

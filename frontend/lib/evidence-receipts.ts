@@ -115,12 +115,20 @@ export async function enrichEvidenceTransaction(id: EvidenceIdentity, read: Evid
 
 export async function loadEvidenceTransaction(id: EvidenceIdentity): Promise<TxStatus> {
   const from = (url: string) => enrichEvidenceTransaction(id, evidenceRead(url));
-  try { return await from(RPC_URL); }
-  catch (error) {
-    // Repeat the ENTIRE lookup/enrichment against archival RPC; do not mix providers.
-    if (ARCHIVAL_RPC_URL && error instanceof RpcError && error.kind !== "contract") return from(ARCHIVAL_RPC_URL);
-    throw error;
+  // Historical evidence is read from archival RPC first. A regular node may prune
+  // the transaction or time out before the UI can reach the archival fallback.
+  // Only transport/RPC failures permit trying the other endpoint; malformed or
+  // contradictory receipt evidence remains fail-closed.
+  const endpoints = [...new Set([ARCHIVAL_RPC_URL, RPC_URL].filter(Boolean))];
+  let last: unknown;
+  for (const endpoint of endpoints) {
+    try { return await from(endpoint); }
+    catch (error) {
+      last = error;
+      if (!(error instanceof RpcError) || error.kind === "contract") throw error;
+    }
   }
+  throw last ?? new Error("No RPC endpoint configured for evidence verification");
 }
 
 // Main's onlyRefundChildren rule: a system native transfer, zero gas price, to
