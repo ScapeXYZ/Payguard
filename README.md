@@ -110,6 +110,12 @@ browser.
 | payguard-demo-001 | settled | [2wryjMdUUbByym5HNqyfwHQqzZ9zunZU1EgCy5FxVUGL](https://testnet.nearblocks.io/txns/2wryjMdUUbByym5HNqyfwHQqzZ9zunZU1EgCy5FxVUGL) | 5omkdRLY1urz635smU3g5W7SDnK3EPoPgAqDhQwVdWKF |
 | payguard-demo-overcap-001 | rejected by guard | [Bykgci7m289krVR2HSJAj6yh46pUJorYv6Hj4ghvCAgv](https://testnet.nearblocks.io/txns/Bykgci7m289krVR2HSJAj6yh46pUJorYv6Hj4ghvCAgv) | none |
 
+Token contracts in the evidence are record-specific: payguard-live-001 used
+token contract ID 3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af
+under the earlier policy, while payguard-demo-001 and
+payguard-demo-overcap-001 used usdc.fakes.testnet. The current active policy
+covers usdc.fakes.testnet.
+
 See [the evidence file](docs/evidence/payment-evidence-testnet.json). Historical
 lookups require https://archival-rpc.testnet.fastnear.com/ because the default
 public node prunes old transactions.
@@ -153,8 +159,9 @@ GHSA-vfj7-8cjw-p6xm / CVE-2026-93687 path through SDK globbing. Normal builds
 use literal paths, but untrusted build inputs remain a denial-of-service risk.
 tar is overridden to 7.5.22; lower-severity URI-decoding and legacy elliptic
 crypto findings remain. No dependency upgrade or npm audit fix --force was run.
-GitHub Dependabot is reported as showing 4 default-branch alerts (1 high,
-1 moderate, 2 low); confirming the live count remains a follow-up.
+As of November 12, 2026, GitHub Dependabot reported 10 open alerts (5 high,
+2 moderate, 3 low) on the default branch. The existing dependency review
+snapshot predates the current live alert count.
 
 ## Repository map
 
