@@ -12,12 +12,12 @@ import { short } from "@/lib/utils";
 
 // What the RUNNER claims (exporter status rules). Never shown as fact: the chain check sits
 // next to it, and only a verified settled row ever gets a green badge.
-export const STATUS_COPY: Record<EvidenceRecord["status"], { label: string; tone: "danger" | "warn" | "outline" }> = {
-  settled: { label: "runner reports: settled", tone: "outline" },
+export const STATUS_COPY: Record<EvidenceRecord["status"], { label: string; tone: "danger" | "warn" | "ok" | "outline" }> = {
+  settled: { label: "runner reports: settled", tone: "ok" },
   reserved: { label: "runner reports: reserved, transfer not confirmed", tone: "warn" },
-  settlement_failed: { label: "runner reports: reserved, ft_transfer failed", tone: "warn" },
-  rejected: { label: "runner reports: rejected by the guard", tone: "outline" },
-  pending: { label: "runner reports: pending, outcome unresolved", tone: "outline" },
+  settlement_failed: { label: "runner reports: reserved, ft_transfer failed", tone: "danger" },
+  rejected: { label: "runner reports: rejected by the guard", tone: "danger" },
+  pending: { label: "runner reports: pending, outcome unresolved", tone: "warn" },
 };
 
 export const UNKNOWN = "Unknown";
@@ -63,7 +63,7 @@ export function useVerified(file: EvidenceFile | null | undefined, records: Evid
 
 export function VerifyBadge({ v, status }: { v?: Verification; status?: EvidenceRecord["status"] }) {
   if (!v) return <Badge variant="outline">checking chain...</Badge>;
-  if (v.state === "verified") return <Badge variant={v.onchain === "settled" ? "ok" : "outline"} className="gap-1"><BadgeCheck className="size-3" /> verified on chain: {v.onchain}</Badge>;
+  if (v.state === "verified") return <Badge variant={v.onchain === "settled" ? "ok" : v.onchain === "rejected" || v.onchain === "settlement_failed" ? "danger" : "warn"} className="gap-1"><BadgeCheck className="size-3" /> verified on chain: {v.onchain}</Badge>;
   // Null tx_hash / verified_at: never green, never "verified", even when the chain matches.
   if (v.state === "unavailable") return <Badge variant={status === "pending" ? "outline" : "warn"} className="gap-1" title={v.why}><CircleHelp className="size-3" /> verification unavailable</Badge>;
   if (v.state === "mismatch") return <Badge variant="danger" className="gap-1" title={v.detail}><ShieldAlert className="size-3" /> chain disagrees: {v.onchain}</Badge>;
@@ -78,7 +78,7 @@ export function VerifyDetail({ v }: { v?: Verification }) {
     : v.state === "unavailable" ? (v.chain ? `${v.why}. chain shows ${v.chain.onchain}${v.chain.agrees ? "" : ` (${v.chain.detail})`}${failure(v.chain) ? `; ${failure(v.chain)}` : ""}` : v.why)
     : v.state === "mismatch" ? v.detail
     : failure(v) ?? (v.settlementReceiptId ? `ft_transfer receipt ${v.settlementReceiptId.slice(0, 8)}...` : null);
-  return text ? <div className="mt-1 max-w-[220px] text-xs text-muted-foreground">{text}</div> : null;
+  return text ? <div className="mt-1 break-words text-sm text-muted-foreground">{text}</div> : null;
 }
 
 // One row. Any unexpected value renders as an error row; it never takes the page down (review F5).
@@ -93,19 +93,63 @@ function Row({ r, v }: { r: EvidenceRecord; v?: Verification }) {
       reason: reasonText(r.reason),
     };
   } catch (e) {
-    return <tr><td colSpan={8} className="py-2 text-xs text-red-300">Record {String(r?.request_id ?? "?")} couldn&apos;t be displayed: {String((e as Error)?.message ?? e)}</td></tr>;
+    return <div className="rounded-lg border border-red-500/40 px-4 py-3 text-xs text-red-300">Record {String(r?.request_id ?? "?")} couldn&apos;t be displayed: {String((e as Error)?.message ?? e)}</div>;
   }
+  const chain = v && v.state !== "unverifiable" ? (v.state === "unavailable" ? v.chain : v) : null;
+  const receiptId = chain?.settlementReceiptId ?? r.settlement_receipt_id;
   return (
-    <tr className="align-top">
-      <td className="py-2 font-mono text-xs">{r.request_id}{r.scenario && <Badge variant="outline" className="ml-1" title="scenario tag reported by the runner">{r.scenario}</Badge>}</td>
-      <td className="font-mono text-xs">{short(r.agent_id, 10)} → {short(r.recipient_id, 10)}</td>
-      <td className="font-mono text-xs">{short(r.token_id, 12)}</td>
-      <td title="symbol and decimals as reported by the runner, not read from chain">{cells.amount}</td>
-      <td><Badge variant={cells.status.tone}>{cells.status.label}</Badge>{cells.reason && <div className="mt-1 text-xs text-muted-foreground">runner reason: {cells.reason}</div>}</td>
-      <td><VerifyBadge v={v} status={r.status} /><VerifyDetail v={v} /><div className="mt-1 text-xs text-muted-foreground" title={r.note ?? undefined}>{r.source}: observed {cells.observed}{r.proposal_id ? ` · proposal #${r.proposal_id}` : ""}</div></td>
-      <td className="text-xs">{cells.when}</td>
-      <td>{r.tx_hash ? <a className="flex items-center gap-1 text-xs text-primary hover:underline" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer">{r.tx_hash.slice(0, 8)}... <ExternalLink className="size-3" /></a> : <span className="text-xs text-muted-foreground">{UNKNOWN}</span>}</td>
-    </tr>
+    <article className="overflow-hidden rounded-xl border border-border bg-muted/10 transition-colors hover:border-primary/40">
+      <header className="flex flex-col gap-3 border-b border-border/70 p-5 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="mb-1 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Request ID</div>
+          <div className="break-all font-mono text-base font-semibold leading-relaxed" title={r.request_id}>{r.request_id}</div>
+          {r.scenario && <Badge variant="outline" className="mt-2" title="scenario tag reported by the runner">scenario {r.scenario}</Badge>}
+        </div>
+        <Badge variant={cells.status.tone} className="self-start whitespace-normal text-center text-sm sm:max-w-[20rem] sm:shrink-0">{cells.status.label}</Badge>
+      </header>
+
+      <section aria-label="Payment summary" className="border-b border-border/70 p-5">
+        <div className="mb-4 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Payment summary</div>
+        <div className="grid gap-5 text-sm sm:grid-cols-2">
+          <div className="rounded-lg border border-border bg-background/30 p-4">
+            <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Amount</div>
+            <div className="mt-1 text-2xl font-semibold leading-tight" title="symbol and decimals as reported by the runner, not read from chain">{cells.amount}</div>
+            <div className="mt-2 font-mono text-sm text-muted-foreground">{r.amount} base units</div>
+          </div>
+          <div className="rounded-lg border border-border bg-background/30 p-4">
+            <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Chain verification</div>
+            <div className="mt-2"><VerifyBadge v={v} status={r.status} /></div>
+          </div>
+          <div className="min-w-0">
+            <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Agent</div>
+            <div className="mt-1 break-all font-mono text-sm" title={r.agent_id}>{r.agent_id}</div>
+          </div>
+          <div className="min-w-0">
+            <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Recipient</div>
+            <div className="mt-1 break-all font-mono text-sm" title={r.recipient_id}>{r.recipient_id}</div>
+          </div>
+          <div className="min-w-0 sm:col-span-2">
+            <div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Token contract</div>
+            <div className="mt-1 break-all font-mono text-sm" title={r.token_id}>{r.token_id}</div>
+          </div>
+        </div>
+      </section>
+
+      <section aria-label="Verification evidence" className="p-5">
+        <div className="mb-4 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">Verification evidence</div>
+        <div className="grid gap-x-6 gap-y-5 text-sm sm:grid-cols-2">
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Transaction</div>{r.tx_hash ? <a className="mt-1 inline-flex max-w-full items-center gap-2 rounded-sm font-mono text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" href={txUrl(r.tx_hash)} target="_blank" rel="noreferrer" title={`Open transaction ${r.tx_hash}`}><span className="break-all">{short(r.tx_hash, 8)}</span><ExternalLink aria-hidden="true" className="size-4 shrink-0" /></a> : <div className="mt-1 text-muted-foreground">{UNKNOWN}</div>}</div>
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Settlement receipt</div><div className="mt-1 break-all font-mono" title={receiptId ?? undefined}>{receiptId ?? UNKNOWN}</div></div>
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Runner reason</div><div className="mt-1 break-words">{cells.reason ?? UNKNOWN}</div></div>
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Chain code</div><div className="mt-1 break-words font-mono">{chain?.chainCode ?? UNKNOWN}</div></div>
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Observation time</div><div className="mt-1 break-words">{r.source} · {cells.observed}</div></div>
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Block time</div><div className="mt-1 break-words">{cells.when} UTC</div></div>
+          {r.proposal_id && <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Proposal</div><div className="mt-1 font-mono">#{r.proposal_id}</div></div>}
+          <div className="min-w-0"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Verification detail</div><div className="mt-1">{v ? <VerifyDetail v={v} /> : <span className="text-muted-foreground">checking chain...</span>}</div></div>
+          <div className="min-w-0 sm:col-span-2"><div className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">Runner note</div><div className="mt-1 break-words" title={r.note}>{r.note || UNKNOWN}</div></div>
+        </div>
+      </section>
+    </article>
   );
 }
 
@@ -137,13 +181,8 @@ export function PaymentHistory({ tokenId }: { tokenId: string }) {
             {all && !all.length && <p className="text-sm text-muted-foreground">{EMPTY_EVIDENCE_TEXT}. An empty export doesn&apos;t prove there were no on-chain payments.</p>}
             {all && all.length > 0 && records && !records.length && <p className="text-sm text-muted-foreground">{EMPTY_EVIDENCE_TEXT} for this token.</p>}
             {ev.data && records && records.length > 0 && (
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[760px] text-sm">
-                  <thead className="text-left text-xs text-muted-foreground"><tr><th className="py-2">Request</th><th>Agent → recipient</th><th>Token</th><th>Amount</th><th>Status</th><th>Chain check</th><th>Time (UTC)</th><th>Tx</th></tr></thead>
-                  <tbody className="divide-y divide-border">
-                    {records.map((r) => <Row key={evidenceKey(ev.data!, r)} r={r} v={verified(r)} />)}
-                  </tbody>
-                </table>
+              <div className="grid gap-3">
+                {records.map((r) => <Row key={evidenceKey(ev.data!, r)} r={r} v={verified(r)} />)}
               </div>
             )}
           </>
