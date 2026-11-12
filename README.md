@@ -1,453 +1,166 @@
 # PayGuard
 
-An on-chain payment policy guard for AI agents on NEAR. **The funded guard
-contract is authoritative.** It owns NEP-141 tokens and initiates `ft_transfer`
-only after checking the configured agent, approved recipients, per-payment cap,
-and persistent per-token UTC-day spending. The TypeScript guard in `src/` is a
-reference/compatibility layer only; its in-memory decisions cannot authorize
-on-chain transfers. Its original API and limitations are in
-[the reference guide](docs/typescript-reference.md).
+> AI proposes. PayGuard checks. The authorized executor pays.
 
-## Build and test locally
+**Track:** AI Security & Defense
 
-Requires Node 22.6+ and npm on Linux x86_64 (the SDK downloads its compiler tools;
-near-workspaces downloads NEAR Sandbox). No Rust installation is required.
+PayGuard is a NEAR on-chain spending guard for AI-agent payments. The guard
+owns the configured NEP-141 test token and authorizes bounded transfers from a
+restricted agent key. The runner and local dashboard preserve and independently
+verify transaction evidence.
 
-```sh
+## Judge quick path
+
+Install and prepare tools:
+
+\`\`\`sh
 npm install --ignore-scripts
-npm run setup:tools       # Download SDK compiler tools and local NEAR Sandbox
-npm test                 # Original 21 regression tests + deterministic policy tests
-npm run check           # TypeScript checks
-npm run build           # build/guard.wasm
-npm run test:sandbox    # Builds guard and local mock FT; runs local blockchain tests
-npm run test:all        # All of the above
-```
+npm run setup:tools
+\`\`\`
 
-SDK 2 publishes a pnpm-only preinstall. To retain this repository's npm workflow,
-install packages with lifecycle scripts disabled and run only the SDK and Sandbox
-tool installers explicitly through `setup:tools`. Dependencies are pinned in the
-lockfile; subsequent installations can use `npm ci --ignore-scripts`.
+Expected: dependencies install without lifecycle scripts and the NEAR SDK and
+local Sandbox tools are installed.
 
-`test:sandbox` explicitly selects Sandbox, never a public network. It funds the
-guard with fake six-decimal USDC, deletes all three guard keys through a signed
-account-action batch, verifies the empty RPC key list, and sends three
-separate signed payments using the agent's sole restricted key, each of
-`"40000000"` units against `"100000000"` daily:
-the first two transfer tokens; the third rejects with `daily_limit`. It also
-tests caller/key restrictions, policy authentication, bad inputs, failed
-cross-contract transfers, and rollover. `tests/mock-ft.ts` is a minimal local
-transfer fixture, **not a production token implementation**.
-Deterministic tests execute the same policy functions as the contract using
-controlled host storage/time; they do not substitute for WASM/Sandbox validation.
-Sandbox fixtures configure long epochs in local genesis before the node starts
-so day-long `fastForward` jumps avoid expensive epoch transitions. Tests observe
-actual finalized block timestamps; neither contract state nor the 24-hour delay
-is patched. Each scenario has a ten-minute timeout. Exact timestamp boundaries
-are also covered by the fast deterministic tests.
+Run the main suite:
 
-## Contract API and accounting
+\`\`\`sh
+npm test
+\`\`\`
 
-- `init({owner_id, agent_id, guardian_id, exit_id})`: once only; predecessor must equal owner. Owner,
-  agent, guardian, guard and exit must be separate accounts. Create/deploy/initialize together
-  as described below to prevent an initialization takeover.
-- `set_policy({token_id, max_per_payment, daily_limit, recipients})`: owner-only,
-  zero deposit. Submits a full token policy under the timelock lifecycle below.
-  Sets both positive u128 limits together; cap cannot exceed daily
-  limit. At most 100 recipients. Empty recipients pauses the token. Existing
-  spending is never reset, even after reconfiguration or lowering limits.
-  Changes govern new authorizations; they cannot cancel previously scheduled transfers.
-- `disable_policy({token_id})`: owner-only, zero deposit; immediately disables the
-  token and cancels any pending proposal, preserving all spending.
-- `cancel_policy()`: owner-or-guardian, zero deposit; clears the pending proposal.
-- `activate_policy({proposal_id})`: permissionless, zero deposit; activates only
-  the exact current proposal after its on-chain deadline, then clears it.
-- `get_pending_policy()`: view returning `null` or
-  `{proposal_id, token_id, policy, activate_after}`; IDs and nanosecond timestamps
-  are decimal strings. `get_policy` returns only the active policy.
-- `propose_cold_key_guardian_change({guardian_id})`: immutable exit predecessor only,
-  zero deposit; queues protected replacement with a full 24-hour delay. Activate with
-  `activate_guardian_change({proposal_id})`; see cold-key recovery below.
-- `pay({request_id, token_id, recipient_id, amount})`: configured agent **predecessor** only,
-  zero deposit, 60–100 Tgas prepaid (use 80 Tgas). Returns the transfer promise.
-- Read-only `get_config`, `get_policy({token_id})`, and
-  `get_spending({token_id, day?})`. Day is a decimal UTC epoch-day string;
-  omitted day uses current block timestamp.
+Expected: 135 tests pass. The command includes read-only Testnet deployment
+checks; it does not deploy.
 
-### Policy timelock lifecycle
+View the three committed Testnet records:
 
-The fixed delay is **24 hours** (`86400000000000` nanoseconds), measured from
-NEAR's trusted block timestamp. No public method can configure or skip it.
-Both initial token enablement and re-enablement require this delay. Submit
-`set_policy`, inspect `get_pending_policy`, wait until `activate_after`, then
-call `activate_policy` with that proposal's ID. Expiry alone does not activate it.
-Any account may activate; it cannot supply a replacement policy or deadline.
-The agent identity remains immutable; owner recovery and guardian succession follow the lifecycle below.
+- [payguard-live-001](https://testnet.nearblocks.io/txns/3AsqcEjmfCBgfUNVcNNA3BHuRJSfQwQEW9QEVr9wdReV)
+- [payguard-demo-001](https://testnet.nearblocks.io/txns/2wryjMdUUbByym5HNqyfwHQqzZ9zunZU1EgCy5FxVUGL)
+- [payguard-demo-overcap-001](https://testnet.nearblocks.io/txns/Bykgci7m289krVR2HSJAj6yh46pUJorYv6Hj4ghvCAgv)
+- [committed evidence](docs/evidence/payment-evidence-testnet.json)
 
-A full replacement is immediate only if both limits are no higher and every
-recipient was already approved. Duplicates/casing are normalized before comparison.
-Missing fields reject; partial patches are unsupported. Empty recipients pause
-payments immediately when limits do not increase. For mixed changes, the active
-policy immediately takes the minimum of each old/new cap and the intersection of
-recipients; the full requested policy waits. Any increase, added recipient, or
-new/disabled token is conservatively delayed, even if its recipient set is empty.
+Expected: two settled records and one guard-rejected over-cap record. The
+committed file is authoritative for exact statuses and receipt IDs. Nearblocks
+returned HTTP 403 when one sample URL was fetched from this environment, so
+external resolution was not independently confirmed.
 
-Only one proposal can be pending across all tokens. Another loosening/mixed update
-rejects atomically with `pending_policy_exists`; cancel first to propose anew,
-which starts a fresh full delay and new monotonically increasing ID. An immediate
-non-loosening update (including an identical policy) or token disable cancels any
-pending proposal globally. This prevents an older queued change from undoing
-later tightening. Activation with an old ID fails, even if a new proposal exists.
-Cancellation never rolls back the tightening portion of a mixed update.
-No lifecycle operation changes current or historical spending or replay markers.
-Changes affect new authorizations, not transfers already scheduled.
+Run the dashboard:
 
-Amounts are canonical positive decimal **strings in smallest units**, bounded by
-u128; JSON numbers, decimals, exponent notation, signs and leading zeros reject.
-There is no floating-point conversion or token-decimal lookup. For a token with
-six decimals, 40 tokens is `"40000000"`. The owner must verify token decimals.
+\`\`\`sh
+cd frontend
+npm install
+npm run dev
+\`\`\`
 
-Token identifiers are actual NEP-141 contract account IDs, ASCII-lowercased and
-validated consistently on every configuration, payment and view. Symbols such as
-`USDC` have no alias mapping; they cannot select a configured USDC contract.
-Whitespace and malformed separators reject. Recipient IDs are normalized the
-same way. The guard cannot be its own token contract or payment recipient.
+Open http://localhost:3000. Expected: live guard policy, spending state and
+evidence-backed payment history. The dashboard re-verifies transactions through
+read-only RPC.
 
-Storage keys are `policy:<canonical-token-id>` and
-`spent:<canonical-token-id>:<UTC-epoch-day>`. Block timestamp nanoseconds divided
-by `86400000000000` determines the day; the caller cannot supply time or totals.
-Checks and reservation occur synchronously within one NEAR receipt. NEAR
-serializes receipts against contract state, so separate transactions share the
-same committed budget. Rejected guard calls do not consume budget. A panic in
-the guard receipt rolls back that receipt, including its reservation.
-Accounting uses the authorization day, not the later transfer-settlement day.
+The complete suite is npm run test:all: 145 tests, and slow because Sandbox
+takes roughly 15 minutes. Root commands also include npm run check,
+npm run build, npm run test:sandbox, npm run test:runner and
+npm run test:evidence. The frontend suite has 134 tests:
+cd frontend && npm test.
 
-`request_id` is required: 1–64 ASCII letters, digits, underscores or hyphens,
-case-sensitive and unique across this guard's lifetime. Persist a stable business
-request ID before submission and reuse it for every retry. A persistent
-`request:<request_id>` marker is committed with spending and promise creation.
-Reuse rejects with `duplicate_request`, even with different payment arguments,
-after policy changes, after a failed transfer, or on a later UTC day. A rejection
-before reservation does not consume the ID. Fresh IDs represent new payments;
-the contract cannot infer that different IDs describe the same business intent.
+## The problem
 
-This is an on-chain API change: callers must now supply `request_id`. Existing
-policy/spending storage remains readable, but legacy payments made without IDs
-cannot be deduplicated retrospectively. The test helper creates fresh IDs for
-distinct test payments; production retry logic must retain its original ID.
+AI systems can propose useful payments without needing unrestricted control of
+a funded account. PayGuard constrains recipients, amounts, frequency and
+retries while preserving a reviewable record of what the chain executed.
 
-Ordinary `pay` schedules only `ft_transfer` on the configured token contract, with
-the validated recipient/amount, 30 Tgas and 1 yoctoNEAR from the guard. It exposes
-no raw-call, native withdrawal, spending reset, refund, or key-management method.
-It accepts ordinary incoming `ft_transfer` deposits after token registration;
-it does not implement `ft_on_transfer` / `ft_transfer_call` deposits.
+## What is shipped
 
-## Asynchronous failures
+Recipient allowlists; a per-payment cap; a UTC-calendar-day daily cap; replay
+protection by stable request ID; a restricted FunctionCall agent key; a
+24-hour policy timelock; guardian veto; delayed owner recovery; emergency
+sweep to the immutable exit; receipt-verified evidence export; and a local
+dashboard.
 
-Reservation and transfer settlement are **not atomic across contracts**. Once
-the guard receipt commits, its reservation survives a later token receipt
-failure (unregistered recipient, insufficient FT balance, token panic or gas
-failure). Failed transfers leave tokens with the guard on a compliant NEP-141
-contract. Failed attached deposits are handled by NEAR, not a PayGuard refund.
+The active Testnet policy is 1 USDC.e per payment and 3 USDC.e per UTC day,
+with merchant.myvirusmy.testnet allowlisted. The token is
+usdc.fakes.testnet, metadata symbol USDC.e and six decimals, and is a valueless
+test token.
 
-There is deliberately no callback that releases budget and no reconciliation
-method that can reset it. Operators should inspect final receipt outcomes and
-token balances when reconciling off-chain. A returned promise failure does not
-mean the guard reservation rolled back. Same-ID retries reject without paying
-again; a deliberately new ID reserves again. The agent can exhaust its
-daily budget with failed transfers and must wait until a new UTC day (or a
-trusted owner deliberately changes policy). This conservative accounting also
-handles a missing/failed payment callback because payments have no callback.
+## Architecture and roles
 
-## Testnet deployment outline and keys
+\`\`\`
+AI proposal -> payment runner -- restricted pay key --> guard
+                                                       |
+                                      policy + replay + UTC-day reservation
+                                                       |
+                                                       v
+                              usdc.fakes.testnet::ft_transfer
+                                                       |
+                                                       v
+                                      merchant.myvirusmy.testnet
 
-These are setup instructions, not actions performed by the test suite. Use only
-testnet accounts and valueless test tokens; no mainnet deployment is included.
+owner myvirusmy.testnet       policy administration and recovery
+guardian guardian.myvirusmy.testnet  veto and recovery
+exit exit.myvirusmy.testnet  immutable emergency-sweep destination
+\`\`\`
 
-1. Create separate owner, agent and independently controlled guardian accounts. Keep setup full-access credentials
-   with the trusted operator until their on-chain retirement. In **one transaction action batch signed by owner**,
-   receiver a new child guard account: create account, fund storage,
-   add a temporary operator-only full-access key, deploy `build/guard.wasm`, and call `init`
-   with `{owner_id, agent_id, guardian_id, exit_id}` and zero deposit. The Sandbox fixture demonstrates
-   this sequence. Do not deploy uninitialized code publicly: an attacker could
-   claim it by naming themselves owner. A separate owner cannot deploy arbitrary
-   code onto an existing account; the creation batch establishes this authority.
-2. Owner calls `set_policy` with verified testnet token contract IDs, decimal
-   integer limits and approved account IDs. Inspect the pending proposal, wait
-   the full 24 hours, activate its ID, and verify the active policy. Register guard and recipient accounts
-   via the token's `storage_deposit` using trusted funds. Transfer test tokens to
-   guard via `ft_transfer`. Fund guard with enough test NEAR for code/storage and
-   outgoing 1 yoctoNEAR deposits. The agent account holds gas funds only.
-3. Using agent's operator-held full-access key, install a fresh **function-call
-   access key** whose receiver is exactly the guard account, method allowlist is
-   exactly `["pay"]`, and allowance is finite (for example
-   `"1000000000000000000000000"` yoctoNEAR = 1 NEAR of gas fees). Give only this
-   restricted private key to the AI. Never put private keys in this repository.
-   The Sandbox fixture demonstrates installation with
-   `transactions.functionCallAccessKey(guard.accountId, ["pay"], allowance)`.
-4. Inspect the installed key using RPC `view_access_key`. Verify receiver,
-   `["pay"]`, and finite remaining allowance. Empty method lists permit **every**
-   method; omitted/unlimited allowance is inappropriate. Sign agent transactions
-   with zero deposit and 80 Tgas. The key cannot transfer native NEAR, attach
-   deposits, deploy code, add keys, call token contracts, or call owner methods.
-   After verifying it, retire every other agent key with agent-signed `DeleteKey`
-   actions, leaving exactly this function-call key. This also removes direct agent
-   key rotation/recovery: replace the deployment if the key is lost or exhausted.
-5. Complete the verification and **irreversible guard lock** in
-   [the exact key-management runbook](docs/key-management.md). Enumerate every
-   on-chain guard key and delete all of them, including function-call keys and
-   the signing full-access key, using guard-signed account actions. Confirm the
-   finalized RPC key list is empty before treating this deployment as locked.
-   Any real-network deletion requires separate explicit operator confirmation;
-   the repository tests perform deletion only on local Sandbox accounts.
+Only the configured agent predecessor may call pay; its key is restricted to
+the guard's pay method. The guard owns the NEP-141 tokens. The browser signs
+owner, guardian and exit operations; the runner keeps the agent key outside the
+browser.
 
-Function-call allowance limits cumulative gas fees, **not token spending**, and
-does not encode a per-call gas cap. PayGuard additionally enforces 60–100 Tgas
-for accepted `pay` calls. Rejected calls can still burn gas up to protocol limits;
-the finite allowance bounds that exposure. The configured agent predecessor
-check protects the contract even when other accounts call `pay` with their own
-full-access keys. No reliance is placed on `signer_account_id` for authorization.
-See [NEAR access keys](https://near.github.io/nearcore/DataStructures/AccessKey.html)
-and [asynchronous cross-contract calls](https://docs.near.org/smart-contracts/anatomy/crosscontract).
+## Live Testnet proof
 
-## Security boundaries and limitations
+| Request | Status | Transaction | Settlement receipt |
+|---|---|---|---|
+| payguard-live-001 | settled | [3AsqcEjmfCBgfUNVcNNA3BHuRJSfQwQEW9QEVr9wdReV](https://testnet.nearblocks.io/txns/3AsqcEjmfCBgfUNVcNNA3BHuRJSfQwQEW9QEVr9wdReV) | AKpNHoTaCXMNX8cjKbw5qHre54pEpBMFthTPvri3SCme |
+| payguard-demo-001 | settled | [2wryjMdUUbByym5HNqyfwHQqzZ9zunZU1EgCy5FxVUGL](https://testnet.nearblocks.io/txns/2wryjMdUUbByym5HNqyfwHQqzZ9zunZU1EgCy5FxVUGL) | 5omkdRLY1urz635smU3g5W7SDnK3EPoPgAqDhQwVdWKF |
+| payguard-demo-overcap-001 | rejected by guard | [Bykgci7m289krVR2HSJAj6yh46pUJorYv6Hj4ghvCAgv](https://testnet.nearblocks.io/txns/Bykgci7m289krVR2HSJAj6yh46pUJorYv6Hj4ghvCAgv) | none |
 
-An owner compromise can immediately pause/restrict payments or cancel proposals
-(denial of service). It can loosen policy only after the 24-hour delay; monitoring
-and an owner or guardian cancellation response are required during that
-window. A separately configured guardian can veto proposals and initiate delayed owner recovery; there is no automatic veto. An
-attacker retaining owner authority can re-propose and eventually activate malicious
-changes, including malicious tokens/recipients. The delay does not protect funds
-after that deadline, recover a compromised key, or stop payments already allowed
-by the active policy. Before locking, guard-account full-access
-key holders can replace code or bypass the guard; after the required zero-key
-lock, this contract has no code upgrade, key recovery, or state reset path.
-The agent must never receive setup full-access keys or control another funded
-execution path. Only tokens held by the guard are covered.
-No native NEAR payments, swaps, arbitrary contract calls, dynamic agent rotation,
-automated refunds, or storage cleanup are implemented. Replacing the deployment
-or using another funded guard starts a different authorization scope.
+See [the evidence file](docs/evidence/payment-evidence-testnet.json). Historical
+lookups require https://archival-rpc.testnet.fastnear.com/ because the default
+public node prunes old transactions.
 
-Approved token contracts must actually implement trustworthy NEP-141 semantics;
-an owner can configure malicious or upgradeable token code that lies about
-transfers. Syntax validation does not verify token code or economic value.
-Recipients may forward funds after receiving them. Daily means UTC calendar day,
-not rolling 24 hours; spending near midnight can span two daily caps. Historical
-ledger storage grows with active tokens/days and accepted request IDs and needs
-operator-funded storage. Request markers are never pruned, to preserve replay protection.
-Gas budgets must be validated for the chosen token contract. This hackathon
-implementation is unaudited; local tests do not prove production security.
+At finalized block 277286373, checked 2026-11-12 00:04:44.625 UTC, the archival
+RPC returned zero guard access keys. The guard lock transaction was
+[6y54ZqtfZ9xSpESUZnsu3TD6zycTnScfkhoUY78KsUZ8](https://testnet.nearblocks.io/txns/6y54ZqtfZ9xSpESUZnsu3TD6zycTnScfkhoUY78KsUZ8).
+The agent FullAccess key was deleted in
+[84y2S4oAcNgCFKej6y8denrCpKpvbJRrQXQarznt6KqF](https://testnet.nearblocks.io/txns/84y2S4oAcNgCFKej6y8denrCpKpvbJRrQXQarznt6KqF).
+The agent then had exactly one FunctionCall key: receiver guard, method
+pay, finite allowance.
 
-The dependency audit snapshot in [docs/dependency-audit.json](docs/dependency-audit.json)
-reports 0 critical, 12 high, 3 moderate and 13 low affected dependency entries.
-`tar` is overridden to patched version 7.5.22; its extraction API was checked
-against the Sandbox installer's usage. Remaining root advisories involve brace
-pattern parsing, URI decoding and legacy elliptic crypto in development tooling.
-The approved SDK/test stack has no automatic upgrade that resolves all of them.
-Build inputs, downloaded compiler/Sandbox binaries and operator signing tooling
-remain trust boundaries; these findings require review before production use.
-Recheck with `npm audit`; it currently exits nonzero for the remaining findings.
+## NEAR tools used
 
-See [the focused security review](docs/security-review.md) for severity-ranked
-findings, all twelve high-severity dependency entries and their reachability.
+The repository uses near-sdk-js, near-api-js, near-workspaces, NEAR JSON-RPC,
+FunctionCall access keys, NEP-141 token calls, and NEAR Wallet Selector in the
+frontend. It does not use NEAR Intents, Chain Signatures, NEAR AI Cloud, TEEs,
+or the 1-Click Swap SDK.
 
+## Not implemented / roadmap
 
-## Guardian and owner recovery lifecycle
+- Intents quote and chain validation.
+- Wrong-chain detection beyond configured network/RPC checks.
+- Rolling 24-hour limits; the shipped limit is a UTC calendar day.
+- A hosted dashboard; the dashboard runs locally.
+- Formal third-party audit.
 
-New deployments require `guardian_id` and `exit_id` in `init` and return both in `get_config`.
-Owner, agent, guardian and guard must all be distinct. Configuration is persistent
-SDK-managed on-chain state; authorization always uses NEAR predecessor, never
-signer or a supplied identity. This initialization API is incompatible with older
-clients. Existing locked deployments cannot upgrade to this code.
+## Security status and limitations
 
-`cancel_policy()` accepts the current owner or guardian, immediately invalidates
-pending loosening and leaves active policy, daily spending and request markers
-untouched. Previously applied mixed-change tightening remains active.
+Failed downstream token transfers keep their reservation and request marker.
+The token contract is trusted because the owner configures it. Stable request
+IDs are the caller's job. Evidence relies on RPC receipts, not multi-provider
+proof or independent balance reconciliation. The zero-key guard cannot be
+upgraded or re-keyed. Owner, guardian and exit remain ordinary keyed accounts
+and are the recovery path. This is a focused security review, not a formal
+third-party audit.
 
-Guardian-only `propose_owner_recovery({owner_id})` stores a unique proposal ID,
-replacement account and `activate_after` in nanoseconds. Inspect with
-`get_pending_owner_recovery()`. Creation clears pending policy and guardian-initiated guardian changes;
-owner-proposed guardian changes survive. A pending cold-key guardian change blocks
-recovery creation and activation (`cold_key_guardian_change_pending`).
-Recovery freezes all policy loosening, including enablement, and policy activation;
-owner tightening, disabling and cancellation remain available. Existing bounded
-agent payments continue. Owner-only `cancel_owner_recovery()` uses the current
-NEAR `predecessor_account_id`, requires zero deposit, and immediately clears the
-pending recovery without a timelock or guardian approval, even after its deadline
-if activation has not executed. Guardian, agent and third parties cannot cancel.
-Canceled activation rejects with `no_pending_identity`, including after the former
-deadline. Cancellation releases the recovery freeze but does not restore proposals
-cleared when recovery began. It changes no active identity, policy, spending or
-replay marker. A successful veto persists `recovery_cooldown_until` at trusted block time plus
-24 hours (`86400000000000` ns). Recovery proposals before that timestamp fail
-with exact error `recovery_cooldown`, including proposals from the current guardian.
-`get_recovery_cooldown()` returns the decimal nanosecond deadline ("0" initially).
-Calling cancellation without pending recovery is a no-op and does not extend it.
-Cooldown survives identity changes and does not block safe administration,
-guardian replacement, or activation. At expiry a new recovery still waits a fresh
-full 24 hours.
-Every new or replacement proposal gets a new ID and a fresh full 24-hour delay;
-cancellation never resets the sequence or preserves a reusable deadline.
-Neither proposing nor activating recovery requires an owner signature, so a truly
-lost owner key does not block recovery.
-Permissionless `activate_owner_recovery({proposal_id})` requires the current ID
-and trusted block timestamp at least 24 hours after proposal. Only then does the
-new owner acquire policy administration and the old owner lose it. The new owner
-still waits the ordinary policy timelock for loosening.
+The dependency snapshot says the 12 high entries are affected packages, not 12
+independent advisories, and trace to the build-time braces
+GHSA-vfj7-8cjw-p6xm / CVE-2026-93687 path through SDK globbing. Normal builds
+use literal paths, but untrusted build inputs remain a denial-of-service risk.
+tar is overridden to 7.5.22; lower-severity URI-decoding and legacy elliptic
+crypto findings remain. No dependency upgrade or npm audit fix --force was run.
+GitHub Dependabot is reported as showing 4 default-branch alerts (1 high,
+1 moderate, 2 low); confirming the live count remains a follow-up.
 
-Current-owner-or-guardian `propose_guardian_change({guardian_id})`,
-`get_pending_guardian_change()` and permissionless
-`activate_guardian_change({proposal_id})` provide succession with a fixed full
-24-hour delay. Each superseding proposal gets a fresh ID and deadline. The pending
-view adds `owner_proposed` (boolean). Owner proposals take priority over competing proposals: a guardian
-cannot overwrite one (`owner_guardian_change_pending`), and recovery proposals
-cannot erase one. The owner can propose during pending recovery. Guardian-initiated
-changes remain blocked during recovery and are cleared when recovery starts.
-For ordinary changes, current-guardian-only `cancel_guardian_change()` authenticates through NEAR
-`predecessor_account_id` and requires zero attached deposit. It immediately clears
-any ordinary pending guardian replacement, including owner proposals, even after maturity.
-Cold-key proposals are protected from this veto (`cold_key_guardian_change_pending`).
-Activation then fails with `no_pending_identity`, including after the original
-deadline. Cancellation changes no active identity, policy, spending, replay marker,
-pending owner recovery or recovery cooldown. With no pending change it is a no-op.
-The owner or current guardian can propose again under the existing rules; every
-fresh proposal has a new ID and a fresh full 24-hour delay.
+## Repository map
 
-Activation of a valid guardian change is allowed despite pending recovery and
-clears that recovery atomically. The displaced guardian immediately loses all
-guardian permissions; its queued recovery can never activate afterward.
-Conversely, recovery activated first clears an ordinary pending guardian change, preventing
-the former owner's queued administration from surviving loss of ownership.
-For ordinary guardian changes, receipt order decides between matured activations.
-A pending cold-key proposal blocks owner recovery regardless of either deadline.
-A responsive owner should veto recovery before waiting for replacement maturity.
-Replacement identities must differ from current owner, guardian, agent, immutable exit and guard.
-All mutation calls require zero deposit. Authentication uses current NEAR
-predecessor, never signer; no caller-supplied time or delay is accepted.
-
-Use separately controlled owner and guardian accounts with independent monitoring.
-A compromised guardian can veto policy and freeze loosening until the owner
-responds. It can veto ordinary owner attempts to replace it indefinitely, but
-immutable cold custody can initiate protected replacement as described below. It cannot
-repeatedly propose owner recovery during the owner-veto cooldown. If recovery activates before
-the owner responds, the old owner loses authority. A compromised owner can veto
-legitimate recovery and queue guardian removal; this design cannot distinguish
-key theft from legitimate control. Lost guardian keys no longer block owner-led
-replacement. Cold custody can replace the guardian even if both owner and guardian
-authority are lost; the new guardian can then initiate delayed owner recovery.
-Account validation does not prove replacement existence or usable key custody.
-Monitor identity and policy proposals; timelocks do not trigger alerts.
-
-Recovery preserves the zero-key guard architecture, immutable payment agent,
-policy limits, UTC spending history and lifetime request markers. It cannot cancel
-already scheduled transfers, repair token code, upgrade WASM, recover arbitrary
-assets, restore guard access keys or replenish the restricted agent's allowance.
-A compromised current owner can veto guardian recovery repeatedly; this veto
-protects a responsive legitimate owner but cannot distinguish compromise from
-legitimate control. The old owner can also tighten/disable during the recovery window. Ordinary allowed payments remain exposed during that window.
-
-## Emergency cold exit (PR #10)
-
-New deployments use `init({owner_id, agent_id, guardian_id, exit_id})` and expose
-all four IDs through `get_config()`. `exit_id` must already be a canonical lowercase
-NEAR account ID, separate from guard, owner, agent and guardian. It is permanent:
-there is no setter, migration or upgrade method. Recovery and guardian rotation
-cannot change it or adopt it as a replacement identity.
-
-Current owner or current guardian can call `emergency_sweep({token_id})`, with
-zero deposit and 180–250 Tgas (recommended 200 Tgas). Authentication uses
-`predecessor_account_id`. No destination or amount is accepted; extra JSON fields
-cannot override the stored exit. Policy caps, daily limits, allowlists, disabled
-policies, pending recovery and guardian replacement do not restrict this exit.
-Spending and payment request records remain intact. Former identities cannot
-initiate sweeps after rotation; already authorized receipts can still complete.
-
-This sweeps **one NEP-141 token contract per call**, including tokens with no
-payment policy. Operators discover token contract IDs from funding records or an
-external indexer; there is no on-chain enumeration of every asset held by a NEAR
-account. The guard queries that token's `ft_balance_of({account_id: guard})` with
-30 Tgas, then transfers the entire reported u128 balance to `exit_id` via
-`ft_transfer` (30 Tgas, exactly 1 yoctoNEAR from guard). It does not sweep native
-NEAR, NFTs, locked balances, or funds arriving after the balance snapshot.
-Register **both guard and exit on each token**, using that token's
-`storage_deposit`, before funding. The sweep does not auto-register or redirect:
-a compliant token rejects an unregistered exit safely, leaving tokens in guard.
-This follows [NEP-141](https://github.com/near/NEPs/blob/master/neps/nep-0141.md)
-and [NEP-145](https://github.com/near/NEPs/blob/master/neps/nep-0145.md).
-
-The returned promise resolves to `transferred`, `zero_balance`,
-`balance_query_failed`, or `transfer_failed`. The last two are failure statuses,
-**even when the outer transaction succeeds**: inspect the returned value and
-final token balances. Zero balance makes no transfer. Failed queries (including
-malformed/non-u128 responses) and failed transfers release the per-token lock,
-allowing a fresh authorized attempt. Each attempt has a persistent monotonic ID;
-private `on_sweep_balance` and `on_sweep_transfer` callbacks check the active ID.
-Concurrent same-token sweeps reject with `sweep_pending`; different tokens are
-independent. New same-token payments also reject while locked. Previously queued
-payments can race the snapshot and cause a transfer failure; retry after their
-settlement. New deposits can require another sweep. Repeating a completed sweep
-queries the current balance rather than replaying an old amount.
-
-Callbacks reserve 120 Tgas for balance resolution and 30 Tgas for settlement.
-Guard needs native NEAR for storage and outgoing deposits. A callback panic,
-resource exhaustion or protocol failure can leave its token lock stuck; there is
-intentionally no unsafe timeout unlock or administrative reset. Such a failure
-may permanently prevent that token's payments and sweeps on a keyless guard.
-Token code and these fixed gas budgets remain trust/availability boundaries;
-a malicious or upgraded token can lie about balances or success, stall, or reject.
-A compromised owner **or guardian** can force immediate evacuation to the cold
-account, so cold custody must be independent, usable and monitored. Loss or
-compromise of that immutable destination cannot be repaired by rotation.
-
-
-### Cold-key guardian recovery (PR #12)
-
-Only the immutable `exit_id` predecessor can call
-`propose_cold_key_guardian_change({guardian_id})`, with zero deposit. The pending
-view exposes `cold_key_proposed: true`. This supersedes any guardian proposal and
-uses a fresh proposal ID and the full fixed 24-hour delay. Only cold custody can
-supersede a protected proposal, restarting that delay. The current owner can veto
-it with `cancel_guardian_change()`, before or after maturity, until activation.
-The guardian, exit and strangers cannot veto a cold-key proposal. An owner veto
-changes no recovery, cooldown, policy or payment state. Activation uses the existing
-permissionless `activate_guardian_change({proposal_id})` method.
-
-Neither owner nor guardian can overwrite a protected proposal. The current guardian
-cannot cancel it, before or after its deadline (`cold_key_guardian_change_pending`).
-Ordinary proposals retain their existing guardian veto rules. Policy freeze, pending
-owner recovery, disabled policies and owner-veto cooldown do not restrict cold-key
-proposal or activation. While a cold-key proposal is pending, both owner recovery creation and
-activation reject with `cold_key_guardian_change_pending`, even for a different
-target or an already-mature recovery. Existing recovery remains queued and keeps
-its policy freeze; guardian activation clears it. Owner veto of the cold proposal
-resumes that recovery at its original deadline. Veto the owner recovery separately
-if it is malicious; an already-mature recovery can activate immediately after the
-cold proposal is vetoed. If recovery executes before the cold proposal is received,
-the recovered owner has normal owner veto authority.
-
-Guardian activation atomically clears queued owner recovery and revokes the old
-guardian's policy veto, identity administration and sweep authority. It preserves
-payment accounting, replay markers, policy state, cooldown and immutable `exit_id`.
-The old guardian retains its current permissions until activation; monitor and
-activate promptly after the deadline. Cold-key compromise permits delayed
-guardian takeover if the owner does not veto within the window, so monitor events
-and keep this account independently controlled and offline except
-when recovery or custody operations require it. Losing cold-key authority removes
-this protected escape path; it cannot be rotated or restored by the contract.
-
-
-Identity proposals, vetoes, cooldown starts, identity activations and emergency
-sweep stages emit NEP-297 `EVENT_JSON` logs under `payguard` version `1.0.0`.
-See [event payloads and monitoring rules](docs/security-review.md#monitoring-events).
-Monitor successful receipts from the guard account; sweep scheduling alone does
-not establish a successful transfer.
-
-## Restricted-agent payment CLI
-
-Use `npm run pay:agent -- ... --dry-run` for read-only preflight, `--execute` for
-an explicitly authorized payment, and `--reconcile` for status lookup without
-broadcast. Network, RPC, guard, agent, external credential/journal paths, business
-request ID, token, recipient and integer-string amount are required. The runner
-persists the business intent and signed transaction hash before broadcasting;
-retries reconcile that hash and never silently create a fresh transaction.
-See [payment runner usage, security checks and recovery limits](docs/payment-runner.md).
-Run its mocked-RPC tests with `npm run test:runner` (also included in `npm test`).
+- [contract](contract/) — guard contract.
+- [payment runner](scripts/pay-agent.mjs) and [evidence exporter](scripts/export-payment-evidence.mjs).
+- [frontend](frontend/) — local dashboard.
+- [evidence format](docs/EVIDENCE_FORMAT.md) and [committed evidence](docs/evidence/payment-evidence-testnet.json).
+- [runner guide](docs/payment-runner.md), [key management](docs/key-management.md),
+  [security review](docs/security-review.md), and [dependency snapshot](docs/dependency-audit.json).

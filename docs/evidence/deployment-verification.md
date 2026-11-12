@@ -1,36 +1,35 @@
-# PayGuard Testnet Deployment Verification
+# PayGuard Testnet deployment verification
 
-Verified: October 23, 2026
+This records the current verified state of guard.myvirusmy.testnet. The checks
+were read-only archival RPC queries.
 
-## Deployment
+## Identities and policy
 
-- Network: NEAR Testnet
-- Contract: guard.myvirusmy.testnet
-- Deployed code SHA-256: 08bfbbb60672204aa5d6029b5492ce6932c75b92dfe262f903049984071b9b58
-- Local artifact: build/guard.wasm
-- Local artifact SHA-256: 08bfbbb60672204aa5d6029b5492ce6932c75b92dfe262f903049984071b9b58
-- Result: SHA-256 checksums match
+- Guard: guard.myvirusmy.testnet
+- Owner: myvirusmy.testnet
+- Agent: agent.myvirusmy.testnet
+- Guardian: guardian.myvirusmy.testnet
+- Immutable exit: exit.myvirusmy.testnet
+- Token: usdc.fakes.testnet (USDC.e, 6 decimals)
+- Merchant: merchant.myvirusmy.testnet
+- Active policy: 1,000,000 base units per payment and 3,000,000 per UTC day
 
-## Access Key Verification
+## Finalized key check
 
-- Public key: ed25519:5Urjqwgf2fCcoiv5Kt6Kr7CrCn1Zx7kueQf4mv2SgGh
-- Permission: FullAccess
-- Guard restricted keys: 0
+At finalized block 277286373, checked 2026-11-12 00:04:44.625 UTC:
 
-## Verified Contract Methods
+- guard.myvirusmy.testnet had zero access keys.
+- agent.myvirusmy.testnet had exactly one FunctionCall key, restricted to
+  receiver guard.myvirusmy.testnet, method pay, with finite allowance.
 
-- pay
-- activate_policy
-- emergency_sweep
-- get_policy
-- get_pending_policy
-- get_spending
-- get_config
+The agent FullAccess key was deleted in transaction
+84y2S4oAcNgCFKej6y8denrCpKpvbJRrQXQarznt6KqF; the guard keys were deleted in
+transaction 6y54ZqtfZ9xSpESUZnsu3TD6zycTnScfkhoUY78KsUZ8.
 
-## Limitations
+Exact settled and rejected records, hashes and settlement receipt IDs are in
+[payment-evidence-testnet.json](payment-evidence-testnet.json). Historical
+lookups require the archival RPC because the default public node prunes old
+transactions.
 
-- Contract retains one FullAccess key.
-- Source-to-WASM reproducible build has not been independently verified.
-- No successful live agent payment has been verified yet.
-- Pending USDC policy #2 must be activated before payment testing.
-- Verification represents the observed deployment, not a guarantee against future upgrades.
+This is an observed deployment check, not a formal audit or a guarantee about
+future account activity, token semantics or RPC availability.
