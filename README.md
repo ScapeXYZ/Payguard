@@ -60,6 +60,41 @@ npm run build, npm run test:sandbox, npm run test:runner and
 npm run test:evidence. The frontend suite has 134 tests:
 cd frontend && npm test.
 
+## Baseline vs hackathon work
+
+The first repository commit is `57c8efa`, dated 2026-10-20 08:19:12 UTC, and
+scaffolded README.md, package.json, ROADMAP.md, and the initial reference
+payment checker. The Git history shows the following work after 2026-10-19:
+
+- NEAR-only research and fixes for unconfigured tokens, token normalization,
+  required limits, trusted daily spending, and policy validation.
+- The on-chain guard with replay protection, account locking, timelocked
+  policies, guardian veto, delayed owner recovery, immutable emergency cold
+  exit, and cold-key guardian recovery.
+- The Next.js dashboard with payment caps, guardian/recovery, sweep, wallet
+  signing, live Testnet views, and the proposed Attack Lab.
+- The restricted-agent payment runner with durable reconciliation and the v2
+  evidence exporter, followed by finalized receipt verification, wallet-call
+  binding, safe rendering, and Testnet evidence documentation.
+
+These items are summarized directly from the chronological commit subjects;
+the history does not establish work before the first recorded commit.
+
+## AI assistance and libraries
+
+ChatGPT, OpenAI Codex, and Claude assisted development.
+
+Direct libraries declared by the root package are `@types/node`, `near-api-js`,
+`near-sdk-js`, `near-workspaces`, and `typescript`.
+
+Direct frontend dependencies are `@near-wallet-selector/core`,
+`@near-wallet-selector/meteor-wallet`, `@near-wallet-selector/modal-ui`,
+`@near-wallet-selector/my-near-wallet`, `@radix-ui/react-slot`,
+`class-variance-authority`, `clsx`, `lucide-react`, `next`, `react`,
+`react-dom`, and `tailwind-merge`. Frontend development dependencies are
+`@tailwindcss/postcss`, `@types/node`, `@types/react`, `@types/react-dom`,
+`tailwindcss`, and `typescript`.
+
 ## The problem
 
 AI systems can propose useful payments without needing unrestricted control of
